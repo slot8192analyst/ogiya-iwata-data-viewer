@@ -1,0 +1,239 @@
+:root {
+  --bg: #121212;
+  --panel-bg: #1e1e1e;
+  --border-color: #333333;
+  --text-primary: #e4e4e4;
+  --text-secondary: #999999;
+  --accent: #4f9eff;
+  --accent-hover: #3b82f6;
+  --input-bg: #2a2a2a;
+  --table-header-bg: #262626;
+  --table-row-hover: #242424;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+  margin: 0;
+  padding: 0 16px 40px;
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 0 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.app-header h1 {
+  font-size: 1.3rem;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.icon-btn:hover {
+  background: #2a2a2a;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.status {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+
+.panel h2 {
+  color: var(--text-primary);
+  font-size: 1.05rem;
+  margin-top: 0;
+}
+
+.panel p {
+  color: var(--text-secondary);
+}
+
+.field {
+  margin-bottom: 12px;
+}
+
+.field-row {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+input[type="number"],
+input[type="text"],
+input[type="date"],
+select {
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  min-width: 200px;
+  background: var(--input-bg);
+  color: var(--text-primary);
+}
+
+select[multiple] {
+  min-height: 160px;
+}
+
+input::placeholder {
+  color: var(--text-secondary);
+}
+
+.digit-checkboxes {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.digit-checkboxes label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-color);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin: 0;
+  cursor: pointer;
+  background: var(--input-bg);
+  color: var(--text-primary);
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 4px 0;
+  text-decoration: underline;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.tab-btn {
+  padding: 8px 16px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-secondary);
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  background: var(--accent);
+  color: #0d1117;
+  border-color: var(--accent);
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+button#runRankingBtn,
+button#runThresholdBtn,
+button#runTrendBtn {
+  background: var(--accent);
+  color: #0d1117;
+  border: none;
+  padding: 8px 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-top: 8px;
+  font-weight: 600;
+}
+
+button#runRankingBtn:hover,
+button#runThresholdBtn:hover,
+button#runTrendBtn:hover {
+  background: var(--accent-hover);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.result-area {
+  margin-top: 16px;
+}
+
+.result-table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+.result-table th,
+.result-table td {
+  border: 1px solid var(--border-color);
+  padding: 6px 10px;
+  text-align: right;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+}
+
+.result-table th {
+  background: var(--table-header-bg);
+}
+
+.result-table tbody tr:hover {
+  background: var(--table-row-hover);
+}
+
+.result-table td:first-child,
+.result-table th:first-child {
+  text-align: left;
+}
