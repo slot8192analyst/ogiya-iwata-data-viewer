@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>パチスロ実戦データ解析（モック）</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="app-header">
+  <h1>パチスロ実戦データ解析</h1>
+  <div class="header-status">
+    <button id="uploadBtn" class="icon-btn" title="DBファイルを開く" aria-label="DBファイルを開く">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+    </button>
+    <input type="file" id="dbFileInput" accept=".db,.sqlite,.sqlite3" hidden />
+    <span id="statusText" class="status">初期化中です...</span>
+  </div>
+</header>
+
+<section class="panel" id="filterPanel">
+  <h2>共通フィルタ条件</h2>
+
+  <div class="field">
+    <label>対象日の日付末尾（複数選択可・未選択で全日）</label>
+    <div class="digit-checkboxes" id="digitCheckboxes"></div>
+  </div>
+
+  <div class="field">
+    <label for="lookbackDays">ルックバック日数（対象日を含まない直前N日間）</label>
+    <input type="number" id="lookbackDays" value="7" min="1" max="90" />
+  </div>
+
+  <div class="field-row">
+    <div class="field">
+      <label for="startDate">対象期間 開始日</label>
+      <input type="date" id="startDate" />
+    </div>
+    <div class="field">
+      <label for="endDate">対象期間 終了日</label>
+      <input type="date" id="endDate" />
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="machineFilter">機種フィルタ（複数選択可・Ctrl/Cmdキーで複数選択、未選択で全機種）</label>
+    <select id="machineFilter" multiple size="8"></select>
+    <button type="button" id="clearMachineFilterBtn" class="link-btn">選択をクリア</button>
+  </div>
+</section>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="ranking">ランキング別勝率</button>
+  <button class="tab-btn" data-tab="threshold">閾値別勝率</button>
+  <button class="tab-btn" data-tab="trend">月次トレンド</button>
+</nav>
+
+<section class="panel tab-panel active" id="tab-ranking">
+  <h2>ランキング別勝率分析</h2>
+  <p>同機種内でルックバック期間の累積差枚が低い順（ワースト順位）に並べ、順位ごとの対象日の勝率を集計します。機種を複数選択すると機種別に内訳表示します。</p>
+  <button id="runRankingBtn">分析実行</button>
+  <div class="result-area">
+    <table id="rankingTable" class="result-table"></table>
+  </div>
+</section>
+
+<section class="panel tab-panel" id="tab-threshold">
+  <h2>閾値別勝率分析</h2>
+  <div class="field-row">
+    <div class="field">
+      <label for="thresholdDirection">比較方向</label>
+      <select id="thresholdDirection">
+        <option value="le">以下</option>
+        <option value="ge">以上</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="thresholdValues">閾値（累積差枚、カンマ区切りで複数指定可）</label>
+      <input type="text" id="thresholdValues" value="-3000,-2000,-1000,0" />
+    </div>
+  </div>
+  <button id="runThresholdBtn">分析実行</button>
+  <div class="result-area">
+    <table id="thresholdTable" class="result-table"></table>
+  </div>
+</section>
+
+<section class="panel tab-panel" id="tab-trend">
+  <h2>月次トレンド</h2>
+  <div class="field-row">
+    <div class="field">
+      <label for="trendMode">集計モード</label>
+      <select id="trendMode">
+        <option value="rank">特定の順位（ワースト何位）</option>
+        <option value="threshold">閾値条件</option>
+      </select>
+    </div>
+    <div class="field" id="trendRankField">
+      <label for="trendRankValue">ワースト順位</label>
+      <input type="number" id="trendRankValue" value="1" min="1" />
+    </div>
+    <div class="field" id="trendThresholdField" style="display:none;">
+      <label for="trendThresholdDirection">比較方向</label>
+      <select id="trendThresholdDirection">
+        <option value="le">以下</option>
+        <option value="ge">以上</option>
+      </select>
+      <input type="text" id="trendThresholdValue" value="-2000" />
+    </div>
+  </div>
+  <button id="runTrendBtn">分析実行</button>
+  <div class="result-area">
+    <table id="trendTable" class="result-table"></table>
+    <canvas id="trendChart" height="120"></canvas>
+  </div>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.14.2/dist/sql-wasm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="app.js"></script>
+</body>
+</html>
