@@ -75,15 +75,16 @@ UI層はSqlDriverを直接呼ばない。分析層を経由する。
 
 | ファイル | 内容 |
 |---|---|
-| index.html | 画面構成（フィルタ・タブ・各分析パネル） |
-| style.css | ダークテーマのスタイル |
-| app.js | ロジック全般（本設計書のモジュール一覧に対応） |
-| hall_data.db | 実戦データ本体（同一ディレクトリに配置） |
+| site/index.html | 画面構成（フィルタ・タブ・各分析パネル） |
+| site/style.css | ダークテーマのスタイル |
+| site/app.js | ロジック全般（本設計書のモジュール一覧に対応） |
+| data/hall_data.db | 実戦データ本体。Git管理は継続するが
+  Cloudflare Pagesの配信対象外（Build output directory
+  設定で分離。Pagesの1ファイル25MiB制限を回避するため） |
 
 ## 制約・今後の検討事項
 
-- 現在34MB弱、年間+21MB想定。100MB超で
-  Cloudflare D1移行を検討（データ移行はSQLiteダンプで可能）。
+- DBはローカルアップロード方式に統一。自動読込は廃止済み。
 - 利用者3人限定。認証は未実装。必要ならCloudflare Access検討。
 - 自由SQL入力は非対応方針。
 - 動作確認はローカルHTTPサーバー経由が必須

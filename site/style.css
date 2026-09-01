@@ -87,6 +87,44 @@ body {
   color: var(--text-secondary);
 }
 
+/* フィルタパネルをサイドパネル化。position: fixedにより
+   通常のレイアウトフローから外れ、開閉が下のタブ位置に
+   影響しない */
+.sidebar-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  width: min(360px, 90vw);
+  border-radius: 0;
+  overflow-y: auto;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
+  z-index: 100;
+}
+
+.sidebar-panel.open {
+  transform: translateX(0);
+}
+
+.sidebar-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.filter-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 90;
+}
+
+.filter-backdrop.visible {
+  display: block;
+}
+
 .field {
   margin-bottom: 12px;
 }

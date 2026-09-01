@@ -3,7 +3,6 @@
 // ==============================
 const SQL_JS_VERSION = "1.14.2";
 const SQL_WASM_CDN = `https://cdn.jsdelivr.net/npm/sql.js@${SQL_JS_VERSION}/dist/`;
-const DEFAULT_DB_FILENAME = "./hall_data.db";
 
 const DEFAULT_LOOKBACK_DAYS = 7;
 const DIGIT_MIN = 0;
@@ -18,6 +17,9 @@ const TrendMode = { RANK: "rank", THRESHOLD: "threshold" };
 
 // 機種を複数選択したときに内訳表示へ切り替えるためのモード
 const BreakdownMode = { AGGREGATE: "aggregate", BY_MACHINE: "by_machine" };
+
+// フィルタサイドパネルの開閉状態
+const SidebarState = { OPEN: "open", CLOSED: "closed" };
 
 const CHART_TEXT_COLOR = "#e4e4e4";
 const CHART_AXIS_COLOR = "#999999";
@@ -99,17 +101,6 @@ async function loadDbFromArrayBuffer(buf) {
   );
   const row = countRes[0].values[0];
   setStatus(`読み込み完了：${row[0]}行（${row[1]} ～ ${row[2]}）`);
-}
-
-async function tryLoadDefaultDb() {
-  const res = await fetch(DEFAULT_DB_FILENAME);
-  if (!res.ok) {
-    setStatus("hall_data.dbが見つかりません。左のボタンから選択してください。");
-    return;
-  }
-
-  const buf = await res.arrayBuffer();
-  await loadDbFromArrayBuffer(buf);
 }
 
 // ==============================
@@ -571,6 +562,22 @@ async function runWithIndicator(button, fn) {
 }
 
 // ==============================
+// フィルタサイドパネル開閉
+// ==============================
+function setFilterSidebarState(state) {
+  const isOpen = state === SidebarState.OPEN;
+
+  document.getElementById("filterPanel").classList.toggle("open", isOpen);
+  document.getElementById("filterBackdrop").classList.toggle("visible", isOpen);
+  document.getElementById("filterToggleBtn").setAttribute("aria-expanded", isOpen);
+}
+
+function toggleFilterSidebar() {
+  const isOpen = document.getElementById("filterPanel").classList.contains("open");
+  setFilterSidebarState(isOpen ? SidebarState.CLOSED : SidebarState.OPEN);
+}
+
+// ==============================
 // UI初期化
 // ==============================
 function setupDigitCheckboxes() {
@@ -670,6 +677,23 @@ function setupHandlers() {
     document.getElementById("trendRankField").style.display = isRank ? "" : "none";
     document.getElementById("trendThresholdField").style.display = isRank ? "none" : "";
   });
+
+  document.getElementById("filterToggleBtn").addEventListener("click", toggleFilterSidebar);
+
+  document.getElementById("filterCloseBtn").addEventListener("click", () => {
+    setFilterSidebarState(SidebarState.CLOSED);
+  });
+
+  document.getElementById("filterBackdrop").addEventListener("click", () => {
+    setFilterSidebarState(SidebarState.CLOSED);
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") {
+      return;
+    }
+    setFilterSidebarState(SidebarState.CLOSED);
+  });
 }
 
 // ==============================
@@ -681,5 +705,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupHandlers();
   setStatus("SQLiteエンジンを初期化しています...");
   await SqlDriver.init();
-  await tryLoadDefaultDb();
+  setStatus("左上のボタンからhall_data.dbを選択してください。");
 });

@@ -11,6 +11,11 @@
 <header class="app-header">
   <h1>パチスロ実戦データ解析</h1>
   <div class="header-status">
+    <button id="filterToggleBtn" class="icon-btn" title="フィルタ条件" aria-label="フィルタ条件" aria-expanded="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 6h16M7 12h10M10 18h4"></path>
+      </svg>
+    </button>
     <button id="uploadBtn" class="icon-btn" title="DBファイルを開く" aria-label="DBファイルを開く">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
@@ -21,8 +26,11 @@
   </div>
 </header>
 
-<section class="panel" id="filterPanel">
-  <h2>共通フィルタ条件</h2>
+<section class="panel sidebar-panel open" id="filterPanel">
+  <div class="sidebar-panel-header">
+    <h2>共通フィルタ条件</h2>
+    <button type="button" id="filterCloseBtn" class="icon-btn" aria-label="閉じる">×</button>
+  </div>
 
   <div class="field">
     <label>対象日の日付末尾（複数選択可・未選択で全日）</label>
@@ -51,6 +59,8 @@
     <button type="button" id="clearMachineFilterBtn" class="link-btn">選択をクリア</button>
   </div>
 </section>
+
+<div id="filterBackdrop" class="filter-backdrop visible"></div>
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="ranking">ランキング別勝率</button>
