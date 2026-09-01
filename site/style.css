@@ -26,19 +26,13 @@ body {
 .app-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   padding: 16px 0 12px;
   flex-wrap: wrap;
   gap: 10px;
 }
 
-.app-header h1 {
-  font-size: 1.3rem;
-  margin: 0;
-  color: var(--text-primary);
-}
-
-.header-status {
+/* ヘッダー左側：導線となるボタン群とタイトルをまとめる */
+.header-left {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -111,6 +105,17 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+}
+
+.sidebar-panel-header h2 {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-panel-header .icon-btn {
+  flex-shrink: 0;
 }
 
 .filter-backdrop {
@@ -248,10 +253,37 @@ button:disabled {
   margin-top: 16px;
 }
 
+/* 結果テーブルの折りたたみ。デフォルトは閉じた状態
+   （summaryのみ表示）で、クリックで開閉する */
+.result-details {
+  margin-bottom: 20px;
+}
+
+.result-details summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 0.9rem;
+  padding: 6px 0;
+  list-style: none;
+}
+
+.result-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.result-details summary::before {
+  content: "▶ ";
+  font-size: 0.7rem;
+}
+
+.result-details[open] summary::before {
+  content: "▼ ";
+}
+
 .result-table {
   border-collapse: collapse;
   width: 100%;
-  margin-bottom: 20px;
+  margin-top: 8px;
 }
 
 .result-table th,
@@ -274,4 +306,10 @@ button:disabled {
 .result-table td:first-child,
 .result-table th:first-child {
   text-align: left;
+}
+
+/* カレンダーピッカーアイコンをダーク背景でも視認できるよう白色化
+   （Chrome/Edge系のみ有効。Firefoxは既定色のまま） */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
 }

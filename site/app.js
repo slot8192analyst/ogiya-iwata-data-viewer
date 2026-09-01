@@ -703,7 +703,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupDigitCheckboxes();
   setupTabs();
   setupHandlers();
+  setFilterSidebarState(SidebarState.CLOSED);
   setStatus("SQLiteエンジンを初期化しています...");
   await SqlDriver.init();
-  setStatus("左上のボタンからhall_data.dbを選択してください。");
+  setStatus("左のボタンからhall_data.dbをアップロードしてください。");
 });
