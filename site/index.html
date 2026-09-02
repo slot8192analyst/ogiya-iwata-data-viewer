@@ -57,6 +57,11 @@
     <select id="machineFilter" multiple size="8"></select>
     <button type="button" id="clearMachineFilterBtn" class="link-btn">選択をクリア</button>
   </div>
+
+  <div class="field">
+    <label>設置台数グループ（機種フィルタとは独立に重ね描き・対象日当日の実測台数で判定・複数選択可・未選択でグループ機能を使用しない）</label>
+    <div class="digit-checkboxes" id="countGroupCheckboxes"></div>
+  </div>
 </section>
 
 <div id="filterBackdrop" class="filter-backdrop"></div>
@@ -69,30 +74,26 @@
 
 <section class="panel tab-panel active" id="tab-ranking">
   <h2>ランキング別勝率分析</h2>
-  <p>同機種内でルックバック期間の累積差枚が低い順（ワースト順位）に並べ、順位ごとの対象日の勝率を集計します。機種を複数選択すると機種別に内訳表示します。</p>
-  <button id="runRankingBtn">分析実行</button>
+  <p>同機種内でルックバック期間の累積差枚が低い順（ワースト順位）に並べ、順位ごとの対象日の勝率を集計します。機種フィルタと設置台数グループフィルタは互いに独立した系列として、選択した分だけ重ねて表示されます（両方選択した場合はクロス集計ではなく単純な合算系列数になります）。勝率の右には95%信頼区間（Wilson score interval）を併記し、件数が少ない行は参考値として表示を弱めています。グラフでは同信頼区間を帯として重ねて描画します。</p>  <button id="runRankingBtn">分析実行</button>
   <div class="result-area">
     <details class="result-details">
       <summary>結果テーブルを表示</summary>
       <table id="rankingTable" class="result-table"></table>
     </details>
+    <canvas id="rankingChart" height="120"></canvas>
   </div>
 </section>
 
 <section class="panel tab-panel" id="tab-threshold">
   <h2>閾値別勝率分析</h2>
-  <div class="field-row">
-    <div class="field">
-      <label for="thresholdDirection">比較方向</label>
-      <select id="thresholdDirection">
-        <option value="le">以下</option>
-        <option value="ge">以上</option>
-      </select>
-    </div>
-    <div class="field">
-      <label for="thresholdValues">閾値（累積差枚、カンマ区切りで複数指定可）</label>
-      <input type="text" id="thresholdValues" value="-3000,-2000,-1000,0" />
-    </div>
+  <div class="field">
+    <label for="thresholdStep">刻み幅（累積差枚 -30,000～30,000枚の範囲を分割）</label>
+    <select id="thresholdStep">
+      <option value="500">500枚おき</option>
+      <option value="1000" selected>1000枚おき</option>
+      <option value="1500">1500枚おき</option>
+      <option value="2000">2000枚おき</option>
+    </select>
   </div>
   <button id="runThresholdBtn">分析実行</button>
   <div class="result-area">
@@ -100,6 +101,7 @@
       <summary>結果テーブルを表示</summary>
       <table id="thresholdTable" class="result-table"></table>
     </details>
+    <canvas id="thresholdChart" height="120"></canvas>
   </div>
 </section>
 
@@ -114,8 +116,8 @@
       </select>
     </div>
     <div class="field" id="trendRankField">
-      <label for="trendRankValue">ワースト順位</label>
-      <input type="number" id="trendRankValue" value="1" min="1" />
+      <label>ワースト順位（複数選択可）</label>
+      <div class="digit-checkboxes" id="trendRankCheckboxes"></div>
     </div>
     <div class="field" id="trendThresholdField" style="display:none;">
       <label for="trendThresholdDirection">比較方向</label>

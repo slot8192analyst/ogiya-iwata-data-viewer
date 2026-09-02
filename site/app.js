@@ -12,20 +12,65 @@ const PERCENT_MULTIPLIER = 100.0;
 const ROUND_DECIMALS = 1;
 const CHART_Y_AXIS_MAX = 100;
 
+// Wilson score intervalの信頼水準95%に対応するz値
+const Z_SCORE_95 = 1.96;
+
+// 件数(n)がこれ未満の行は参考値として表示を弱める
+const MIN_RELIABLE_N = 30;
+
+// 閾値分析の対象範囲（累積差枚）と選択可能な刻み幅
+const THRESHOLD_RANGE_MIN = -30000;
+const THRESHOLD_RANGE_MAX = 30000;
+const DEFAULT_THRESHOLD_STEP = 1000;
+
+// 月次トレンド・順位モードで選択可能なワースト順位の範囲
+const TREND_RANK_MIN = 1;
+const TREND_RANK_MAX = 10;
+const DEFAULT_TREND_RANK = 1;
+
+// 順位ごとの濃淡（明度）の変化量。0が最も濃い（元の色）
+const RANK_SHADE_STEP = 0.09;
+const RANK_SHADE_MAX = 0.75;
+
+// 設置台数グループの固定バケット。判定は対象日・機種名ごとの
+// 実測稼働台数（COUNT DISTINCT machine_no）で、他のフィルタとは
+// 無関係にhall_data全体から算出する。maxがnullの場合は上限なし
+const MACHINE_COUNT_BUCKETS = [
+  { min: 1, max: 2, label: "1~2台" },
+  { min: 3, max: 4, label: "3~4台" },
+  { min: 5, max: 6, label: "5~6台" },
+  { min: 7, max: 9, label: "7~9台" },
+  { min: 10, max: 15, label: "10~15台" },
+  { min: 16, max: 20, label: "16~20台" },
+  { min: 21, max: null, label: "21台以上" },
+];
+
 const ComparisonDirection = { LE: "le", GE: "ge" };
 const TrendMode = { RANK: "rank", THRESHOLD: "threshold" };
 
-// 機種を複数選択したときに内訳表示へ切り替えるためのモード
-const BreakdownMode = { AGGREGATE: "aggregate", BY_MACHINE: "by_machine" };
+// 機種フィルタ・設置台数グループフィルタは互いに独立した「軸」。
+// どちらかが1件以上選択されていれば、選択された軸ごとに独立集計した
+// 系列を単純に並べて重ね描きする（クロス集計ではない）
+const BreakdownMode = { AGGREGATE: "aggregate", BY_SERIES: "by_series" };
 
 // フィルタサイドパネルの開閉状態
 const SidebarState = { OPEN: "open", CLOSED: "closed" };
+
+// グラフを持つ分析タブの識別子。canvas要素IDとChartインスタンスの
+// 紐付けに使う
+const ChartTarget = { RANKING: "ranking", THRESHOLD: "threshold", TREND: "trend" };
+
+const CHART_CANVAS_ID = {
+  [ChartTarget.RANKING]: "rankingChart",
+  [ChartTarget.THRESHOLD]: "thresholdChart",
+  [ChartTarget.TREND]: "trendChart",
+};
 
 const CHART_TEXT_COLOR = "#e4e4e4";
 const CHART_AXIS_COLOR = "#999999";
 const CHART_GRID_COLOR = "#333333";
 
-// 機種別グラフの色。選択機種数がこれを超えたら循環して再利用する
+// 系列グラフの色。系列数がこれを超えたら循環して再利用する
 const CHART_COLOR_PALETTE = [
   { border: "#4f9eff", fill: "rgba(79,158,255,0.15)" },
   { border: "#ff6b6b", fill: "rgba(255,107,107,0.15)" },
@@ -67,7 +112,45 @@ const SqlDriver = (() => {
   return { init, loadFile, run, query, isReady };
 })();
 
-let trendChartInstance = null;
+// ==============================
+// WilsonScore: 勝率の信頼区間計算のみを担当する統計層。
+// サンプル数が少ないほど区間が広がり、数字の見た目だけでは
+// 判断できない「ブレの大きさ」を可視化するために使う。
+//
+// 例: 勝率70%でも
+//   n=10  → 区間は[35%, 93%]付近（広い＝信用しにくい）
+//   n=200 → 区間は[63%, 76%]付近（狭い＝信用できる）
+// ==============================
+const WilsonScore = (() => {
+  function computeInterval(wins, n) {
+    if (n <= 0) {
+      return { low: 0, high: 0 };
+    }
+
+    const p = wins / n;
+    const z2 = Z_SCORE_95 * Z_SCORE_95;
+    const denominator = 1 + z2 / n;
+    const center = p + z2 / (2 * n);
+    const margin = Z_SCORE_95 * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n));
+
+    const lowRaw = (center - margin) / denominator;
+    const highRaw = (center + margin) / denominator;
+
+    return {
+      low: Math.max(0, lowRaw) * PERCENT_MULTIPLIER,
+      high: Math.min(1, highRaw) * PERCENT_MULTIPLIER,
+    };
+  }
+
+  return { computeInterval };
+})();
+
+// タブごとのChartインスタンス。再描画時にdestroy()するために保持する
+const chartInstances = {
+  [ChartTarget.RANKING]: null,
+  [ChartTarget.THRESHOLD]: null,
+  [ChartTarget.TREND]: null,
+};
 
 // 勝ちの定義。基準変更時はここだけ書き換える
 function winCaseExpression() {
@@ -87,11 +170,13 @@ function setStatus(text) {
 async function loadDbFromArrayBuffer(buf) {
   SqlDriver.loadFile(buf);
 
-  // 分析用インデックス。メモリ上DBのため毎回作成し直す
+  // 分析用インデックス。メモリ上DBのため毎回作成し直す。
+  // (date, machine_name)は設置台数グループ判定の集計で使う
   SqlDriver.run(`
     CREATE INDEX IF NOT EXISTS idx_hall_data_date ON hall_data(date);
     CREATE INDEX IF NOT EXISTS idx_hall_data_name_date ON hall_data(machine_name, date);
     CREATE INDEX IF NOT EXISTS idx_hall_data_no_date ON hall_data(machine_no, date);
+    CREATE INDEX IF NOT EXISTS idx_hall_data_date_name ON hall_data(date, machine_name);
   `);
 
   populateMachineFilter();
@@ -193,8 +278,9 @@ function getSelectedMachineNames() {
   return Array.from(select.selectedOptions).map((opt) => opt.value);
 }
 
-function resolveBreakdownMode(machineNames) {
-  return machineNames.length > 0 ? BreakdownMode.BY_MACHINE : BreakdownMode.AGGREGATE;
+function getSelectedCountGroupLabels() {
+  const boxes = document.querySelectorAll("#countGroupCheckboxes input:checked");
+  return Array.from(boxes).map((el) => el.value);
 }
 
 // ==============================
@@ -211,21 +297,66 @@ function getCommonFilters() {
   const startDate = document.getElementById("startDate").value;
   const endDate = document.getElementById("endDate").value;
   const machineNames = getSelectedMachineNames();
-  return { dayDigits, lookbackDays, startDate, endDate, machineNames };
+  const countGroupLabels = getSelectedCountGroupLabels();
+  return { dayDigits, lookbackDays, startDate, endDate, machineNames, countGroupLabels };
+}
+
+// ==============================
+// 独立軸（機種フィルタ／設置台数グループフィルタ）の解決
+//
+// 両フィルタは互いのWHERE条件に干渉しない。選択された軸ごとに
+// 独立集計したクエリをUNION ALLで単純に並べ、同じグラフ上に
+// 重ね描きする（クロス集計ではない）。
+// 例: 機種1つ＋グループ2つ選択 → 3系列（機種1本＋グループ2本）
+// ==============================
+function resolveActiveAxes(machineNames, countGroupLabels) {
+  const axes = [];
+
+  if (machineNames.length) {
+    const list = machineNames.map((n) => `'${escapeSql(n)}'`).join(",");
+    axes.push({ column: "machine_name", filterSql: `machine_name IN (${list})` });
+  }
+
+  if (countGroupLabels.length) {
+    const list = countGroupLabels.map((l) => `'${escapeSql(l)}'`).join(",");
+    axes.push({ column: "count_group", filterSql: `count_group IN (${list})` });
+  }
+
+  return axes;
+}
+
+function resolveBreakdownMode(axes) {
+  return axes.length > 0 ? BreakdownMode.BY_SERIES : BreakdownMode.AGGREGATE;
+}
+
+// ==============================
+// 設置台数グループ判定
+// ==============================
+
+// machine_count(実測稼働台数)をバケットラベルに変換するCASE式
+function buildCountGroupCaseExpression(countColumn) {
+  const whenClauses = MACHINE_COUNT_BUCKETS.map(({ min, max, label }) => {
+    const upperCond = max === null ? "" : ` AND ${countColumn} <= ${max}`;
+    return `WHEN ${countColumn} >= ${min}${upperCond} THEN '${label}'`;
+  });
+  return `CASE ${whenClauses.join(" ")} END`;
 }
 
 // ==============================
 // 共通CTE（ウィンドウ関数版・自己結合なし）
+//
+// 機種名・設置台数グループによる絞り込みはここでは行わない。
+// 設置台数グループ軸の集計には全機種のデータが必要なため、
+// 土台は常に全データで計算し、絞り込みは各分析クエリ側
+// （軸ごとのSELECT）で個別に適用する
 // ==============================
-function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate, machineNames }) {
+function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate }) {
   const digitFilter = dayDigits.length
     ? `AND CAST(strftime('%d', date) AS INTEGER) % 10 IN (${dayDigits.join(",")})`
     : "";
   const rangeFilter =
     startDate && endDate ? `AND date BETWEEN '${startDate}' AND '${endDate}'` : "";
-  const machineFilterRolling = machineNames.length
-    ? `WHERE machine_name IN (${machineNames.map((n) => `'${escapeSql(n)}'`).join(",")})`
-    : "";
+  const countGroupCase = buildCountGroupCaseExpression("mc.machine_count");
 
   return `
     WITH digit_days AS (
@@ -233,21 +364,32 @@ function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate, machineName
       FROM hall_data
       WHERE 1=1 ${digitFilter} ${rangeFilter}
     ),
+    -- 日付・機種名ごとの実測設置台数。他の絞り込み条件と無関係に
+    -- hall_data全体から算出する（機種フィルタや期間フィルタを変えても
+    -- グループ判定の基準がぶれないようにするため）
+    machine_counts AS (
+      SELECT date, machine_name, COUNT(DISTINCT machine_no) AS machine_count
+      FROM hall_data
+      GROUP BY date, machine_name
+    ),
     -- 日付をJulian日数の整数に変換。RANGE BETWEENでカレンダー日数
     -- ベースのウィンドウを組むために必要（ROWS版は行数ベースのため
-    -- 欠損日があると遡って件数を埋めてしまい不採用）
+    -- 欠損日があると遡って件数を埋めてしまい不採用）。
+    -- 機種名フィルタはここでは適用しない（設置台数グループ軸の
+    -- 集計に全機種のデータが必要なため）
     dated AS (
       SELECT
-        date, machine_no, machine_name, diff,
-        CAST(julianday(date) AS INTEGER) AS day_num
-      FROM hall_data
-      ${machineFilterRolling}
+        h.date, h.machine_no, h.machine_name, h.diff,
+        CAST(julianday(h.date) AS INTEGER) AS day_num,
+        ${countGroupCase} AS count_group
+      FROM hall_data h
+      JOIN machine_counts mc ON mc.date = h.date AND mc.machine_name = h.machine_name
     ),
     -- ルックバックはカレンダー日数ベース。欠損日があれば遡らず、
     -- 実在するデータの日数分だけで集計する
     rolling AS (
       SELECT
-        date, machine_no, machine_name, diff,
+        date, machine_no, machine_name, diff, count_group,
         SUM(diff) OVER (
           PARTITION BY machine_no ORDER BY day_num
           RANGE BETWEEN ${lookbackDays} PRECEDING AND 1 PRECEDING
@@ -282,59 +424,97 @@ function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate, machineName
 // ==============================
 // 分析1: ランキング別勝率
 // ==============================
-function runRankingAnalysis() {
-  const filters = getCommonFilters();
-  const cte = buildBaseCte(filters);
-  const breakdownMode = resolveBreakdownMode(filters.machineNames);
-  const byMachine = breakdownMode === BreakdownMode.BY_MACHINE;
+function buildRankingFragment(axis) {
+  const seriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const seriesGroupBy = axis ? "series_label, " : "";
+  const whereClause = axis ? `WHERE ${axis.filterSql}` : "";
 
-  const selectCols = byMachine ? "machine_name, rank_worst," : "rank_worst,";
-  const groupCols = byMachine ? "machine_name, rank_worst" : "rank_worst";
-  const orderCols = byMachine ? "machine_name, rank_worst" : "rank_worst";
-
-  const sql = `
-    ${cte}
+  return `
     SELECT
-      ${selectCols}
+      ${seriesSelect}
+      rank_worst,
       ROUND(AVG(group_size), ${ROUND_DECIMALS}) AS avg_group_size,
       COUNT(*) AS n,
       SUM(is_win) AS wins,
       ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate
     FROM joined
-    GROUP BY ${groupCols}
-    ORDER BY ${orderCols};
+    ${whereClause}
+    GROUP BY ${seriesGroupBy}rank_worst
   `;
+}
+
+// SQL結果の末尾3列は常に n, wins, win_rate（機種軸の有無に関わらず
+// 固定の並び）。ここにWilson信頼区間と参考値フラグを付加する
+function enrichRankingRow(row) {
+  const wins = row[row.length - 2];
+  const n = row[row.length - 3];
+  const { low, high } = WilsonScore.computeInterval(wins, n);
+  const ciLabel = `${low.toFixed(ROUND_DECIMALS)}% ~ ${high.toFixed(ROUND_DECIMALS)}%`;
+
+  return {
+    tableRow: [...row, ciLabel],
+    ciLow: low,
+    ciHigh: high,
+    isReliable: n >= MIN_RELIABLE_N,
+  };
+}
+
+function runRankingAnalysis() {
+  const filters = getCommonFilters();
+  const cte = buildBaseCte(filters);
+  const axes = resolveActiveAxes(filters.machineNames, filters.countGroupLabels);
+  const breakdownMode = resolveBreakdownMode(axes);
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+
+  const fragments = hasSeries
+    ? axes.map((axis) => buildRankingFragment(axis))
+    : [buildRankingFragment(null)];
+  const orderCols = hasSeries ? "series_label, rank_worst" : "rank_worst";
+  const sql = `${cte} ${fragments.join(" UNION ALL ")} ORDER BY ${orderCols};`;
   const res = SqlDriver.query(sql);
-  const headers = byMachine
-    ? ["機種名", "ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)"]
-    : ["ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)"];
-  renderTable("rankingTable", res, headers);
+  const rows = res.length ? res[0].values : [];
+
+  const enriched = rows.map(enrichRankingRow);
+  const tableRows = enriched.map((e) => e.tableRow);
+  const rowClassFn = (idx) => (enriched[idx].isReliable ? null : "low-confidence");
+
+  const headers = hasSeries
+    ? ["系列", "ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "信頼区間(95%)"]
+    : ["ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "信頼区間(95%)"];
+
+  renderTable("rankingTable", tableRows, headers, rowClassFn);
+  renderRankingChart(rows, enriched, breakdownMode);
 }
 
 // ==============================
-// 分析2: 閾値別勝率
+// 分析2: 閾値別勝率（区間集計）
 // ==============================
-function parseThresholds(rawValues) {
-  return rawValues
-    .split(",")
-    .map((v) => v.trim())
-    .filter((v) => v !== "")
-    .map(Number);
+
+// 固定範囲(THRESHOLD_RANGE_MIN ～ THRESHOLD_RANGE_MAX)を
+// 指定刻み幅で分割し、[下限, 上限)の半開区間ペアを生成する
+function generateThresholdBins(step) {
+  const bins = [];
+  for (let lower = THRESHOLD_RANGE_MIN; lower < THRESHOLD_RANGE_MAX; lower += step) {
+    bins.push([lower, lower + step]);
+  }
+  return bins;
 }
 
-function buildThresholdSelect(threshold, op, byMachine) {
-  const selectCols = byMachine ? "machine_name," : "";
-  const groupClause = byMachine ? "GROUP BY machine_name" : "";
+function buildThresholdFragment(axis, lowerBound, upperBound) {
+  const seriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const groupClause = axis ? "GROUP BY series_label" : "";
+  const axisFilter = axis ? `AND ${axis.filterSql}` : "";
 
   return `
     SELECT
-      ${selectCols}
-      ${threshold} AS threshold,
+      ${seriesSelect}
+      ${lowerBound} AS bin_lower,
+      ${upperBound} AS bin_upper,
       COUNT(*) AS n,
       SUM(is_win) AS wins,
       ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate
     FROM joined
-    WHERE cum_diff ${op} ${threshold}
+    WHERE cum_diff >= ${lowerBound} AND cum_diff < ${upperBound} ${axisFilter}
     ${groupClause}
   `;
 }
@@ -342,89 +522,152 @@ function buildThresholdSelect(threshold, op, byMachine) {
 function runThresholdAnalysis() {
   const filters = getCommonFilters();
   const cte = buildBaseCte(filters);
-  const breakdownMode = resolveBreakdownMode(filters.machineNames);
-  const byMachine = breakdownMode === BreakdownMode.BY_MACHINE;
+  const axes = resolveActiveAxes(filters.machineNames, filters.countGroupLabels);
+  const breakdownMode = resolveBreakdownMode(axes);
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
 
-  const direction = document.getElementById("thresholdDirection").value;
-  const op = direction === ComparisonDirection.LE ? "<=" : ">=";
-  const thresholds = parseThresholds(document.getElementById("thresholdValues").value);
+  const step = parseInt(document.getElementById("thresholdStep").value, 10) || DEFAULT_THRESHOLD_STEP;
+  const bins = generateThresholdBins(step);
 
-  if (thresholds.length === 0) {
-    alert("閾値を1つ以上入力してください。");
-    return;
+  const fragments = [];
+  for (const [lower, upper] of bins) {
+    if (!hasSeries) {
+      fragments.push(buildThresholdFragment(null, lower, upper));
+      continue;
+    }
+    for (const axis of axes) {
+      fragments.push(buildThresholdFragment(axis, lower, upper));
+    }
   }
 
-  const unionParts = thresholds.map((t) => buildThresholdSelect(t, op, byMachine));
-  const orderCols = byMachine ? "machine_name, threshold" : "threshold";
-  const sql = `${cte} ${unionParts.join(" UNION ALL ")} ORDER BY ${orderCols};`;
+  const orderCols = hasSeries ? "series_label, bin_lower" : "bin_lower";
+  const sql = `${cte} ${fragments.join(" UNION ALL ")} ORDER BY ${orderCols};`;
   const res = SqlDriver.query(sql);
+  const rows = res.length ? res[0].values : [];
 
-  const label = direction === ComparisonDirection.LE ? "以下" : "以上";
-  const headers = byMachine
-    ? ["機種名", `累積差枚 ${label}`, "件数", "勝ち数", "勝率(%)"]
-    : [`累積差枚 ${label}`, "件数", "勝ち数", "勝率(%)"];
-  renderTable("thresholdTable", res, headers);
+  const headers = hasSeries
+    ? ["系列", "累積差枚 下限", "累積差枚 上限（未満）", "件数", "勝ち数", "勝率(%)"]
+    : ["累積差枚 下限", "累積差枚 上限（未満）", "件数", "勝ち数", "勝率(%)"];
+  renderTable("thresholdTable", rows, headers);
+  renderThresholdChart(res, breakdownMode);
 }
 
 // ==============================
 // 分析3: 月次トレンド
 // ==============================
-function buildTrendWhereClause(mode) {
-  if (mode === TrendMode.RANK) {
-    const rankValue = parseInt(document.getElementById("trendRankValue").value, 10) || 1;
-    return `rank_worst = ${rankValue}`;
-  }
+function getSelectedTrendRanks() {
+  const boxes = document.querySelectorAll("#trendRankCheckboxes input:checked");
+  return Array.from(boxes)
+    .map((el) => parseInt(el.value, 10))
+    .sort((a, b) => a - b);
+}
 
+function buildTrendThresholdWhereClause() {
   const direction = document.getElementById("trendThresholdDirection").value;
   const op = direction === ComparisonDirection.LE ? "<=" : ">=";
   const thresholdValue = Number(document.getElementById("trendThresholdValue").value);
   return `cum_diff ${op} ${thresholdValue}`;
 }
 
-function runTrendAnalysis() {
-  const filters = getCommonFilters();
-  const cte = buildBaseCte(filters);
-  const breakdownMode = resolveBreakdownMode(filters.machineNames);
-  const byMachine = breakdownMode === BreakdownMode.BY_MACHINE;
+function buildTrendRankFragment(axis, ranks) {
+  const seriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const seriesGroupBy = axis ? "series_label, " : "";
+  const axisFilter = axis ? `AND ${axis.filterSql}` : "";
 
-  const mode = document.getElementById("trendMode").value;
-  const whereClause = buildTrendWhereClause(mode);
-
-  const selectCols = byMachine
-    ? "machine_name, strftime('%Y-%m', date) AS ym,"
-    : "strftime('%Y-%m', date) AS ym,";
-  const groupCols = byMachine ? "machine_name, ym" : "ym";
-  const orderCols = byMachine ? "machine_name, ym" : "ym";
-
-  const sql = `
-    ${cte}
+  return `
     SELECT
-      ${selectCols}
+      ${seriesSelect}
+      rank_worst,
+      strftime('%Y-%m', date) AS ym,
       COUNT(*) AS n,
       SUM(is_win) AS wins,
       ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate
     FROM joined
-    WHERE ${whereClause}
-    GROUP BY ${groupCols}
-    ORDER BY ${orderCols};
+    WHERE rank_worst IN (${ranks.join(",")}) ${axisFilter}
+    GROUP BY ${seriesGroupBy}rank_worst, ym
   `;
-  const res = SqlDriver.query(sql);
+}
 
-  const headers = byMachine
-    ? ["機種名", "年月", "件数", "勝ち数", "勝率(%)"]
+// 順位モード: 複数のワースト順位をまとめて取得し、
+// 「順位ごとの年月別勝率」を1系列ずつ描画する
+function runTrendRankAnalysis(cte, axes, breakdownMode) {
+  const ranks = getSelectedTrendRanks();
+  if (ranks.length === 0) {
+    alert("ワースト順位を1つ以上選択してください。");
+    return;
+  }
+
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const fragments = hasSeries
+    ? axes.map((axis) => buildTrendRankFragment(axis, ranks))
+    : [buildTrendRankFragment(null, ranks)];
+  const orderCols = hasSeries ? "series_label, rank_worst, ym" : "rank_worst, ym";
+  const sql = `${cte} ${fragments.join(" UNION ALL ")} ORDER BY ${orderCols};`;
+  const res = SqlDriver.query(sql);
+  const rows = res.length ? res[0].values : [];
+
+  const headers = hasSeries
+    ? ["系列", "ワースト順位", "年月", "件数", "勝ち数", "勝率(%)"]
+    : ["ワースト順位", "年月", "件数", "勝ち数", "勝率(%)"];
+  renderTable("trendTable", rows, headers);
+  renderTrendRankChart(res, breakdownMode);
+}
+
+function buildTrendThresholdFragment(axis, whereClause) {
+  const seriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const seriesGroupBy = axis ? "series_label, " : "";
+  const axisFilter = axis ? `AND ${axis.filterSql}` : "";
+
+  return `
+    SELECT
+      ${seriesSelect}
+      strftime('%Y-%m', date) AS ym,
+      COUNT(*) AS n,
+      SUM(is_win) AS wins,
+      ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate
+    FROM joined
+    WHERE ${whereClause} ${axisFilter}
+    GROUP BY ${seriesGroupBy}ym
+  `;
+}
+
+function runTrendAnalysis() {
+  const filters = getCommonFilters();
+  const cte = buildBaseCte(filters);
+  const axes = resolveActiveAxes(filters.machineNames, filters.countGroupLabels);
+  const breakdownMode = resolveBreakdownMode(axes);
+
+  const mode = document.getElementById("trendMode").value;
+  if (mode === TrendMode.RANK) {
+    runTrendRankAnalysis(cte, axes, breakdownMode);
+    return;
+  }
+
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const whereClause = buildTrendThresholdWhereClause();
+  const fragments = hasSeries
+    ? axes.map((axis) => buildTrendThresholdFragment(axis, whereClause))
+    : [buildTrendThresholdFragment(null, whereClause)];
+  const orderCols = hasSeries ? "series_label, ym" : "ym";
+  const sql = `${cte} ${fragments.join(" UNION ALL ")} ORDER BY ${orderCols};`;
+  const res = SqlDriver.query(sql);
+  const rows = res.length ? res[0].values : [];
+
+  const headers = hasSeries
+    ? ["系列", "年月", "件数", "勝ち数", "勝率(%)"]
     : ["年月", "件数", "勝ち数", "勝率(%)"];
-  renderTable("trendTable", res, headers);
+  renderTable("trendTable", rows, headers);
   renderTrendChart(res, breakdownMode);
 }
 
 // ==============================
 // 表描画
 // ==============================
-function renderTable(elementId, execResult, headerLabels) {
+function renderTable(elementId, rows, headerLabels, rowClassFn = null) {
   const table = document.getElementById(elementId);
   table.innerHTML = "";
 
-  if (!execResult.length) {
+  if (!rows.length) {
     table.innerHTML = "<tr><td>該当データがありません。</td></tr>";
     return;
   }
@@ -440,61 +683,87 @@ function renderTable(elementId, execResult, headerLabels) {
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
-  for (const row of execResult[0].values) {
+  rows.forEach((row, idx) => {
     const tr = document.createElement("tr");
+    const rowClass = rowClassFn ? rowClassFn(idx) : null;
+    if (rowClass) {
+      tr.classList.add(rowClass);
+    }
+
     for (const cell of row) {
       const td = document.createElement("td");
       td.textContent = cell;
       tr.appendChild(td);
     }
     tbody.appendChild(tr);
-  }
+  });
   table.appendChild(tbody);
 }
 
 // ==============================
-// グラフ描画（月次トレンド用・機種別内訳対応）
+// グラフ描画（閾値・月次トレンド共通）
+//
+// SQL結果の列構成は分析ごとに異なる（例: 閾値分析には
+// bin_lower/bin_upperが挟まる）が、グラフに必要なのは常に
+// 「先頭列（ラベル）」と「末尾列（勝率）」だけなので、
+// そこだけ抽出して汎用化する。
 // ==============================
-function groupRowsByMachine(rows, breakdownMode) {
-  if (breakdownMode !== BreakdownMode.BY_MACHINE) {
-    return { "": rows.map((r) => [r[0], r[1], r[2], r[3]]) };
+function extractLabelAndWinRate(row) {
+  return [row[0], row[row.length - 1]];
+}
+
+// 先頭列（series_label。機種名または設置台数グループラベルの
+// いずれか一方が入る）を系列キーとしてグルーピングする
+function groupRowsBySeries(rows, hasSeries) {
+  if (!hasSeries) {
+    return { "": rows.map(extractLabelAndWinRate) };
   }
 
   const grouped = {};
-  for (const [machineName, ym, n, wins, winRate] of rows) {
-    if (!grouped[machineName]) {
-      grouped[machineName] = [];
+  for (const row of rows) {
+    const seriesLabel = row[0];
+    const [label, winRate] = extractLabelAndWinRate(row.slice(1));
+
+    if (!grouped[seriesLabel]) {
+      grouped[seriesLabel] = [];
     }
-    grouped[machineName].push([ym, n, wins, winRate]);
+    grouped[seriesLabel].push([label, winRate]);
   }
   return grouped;
 }
 
-function extractSortedLabels(grouped) {
-  const allYm = new Set();
+function extractSortedLabels(grouped, compareFn) {
+  const labels = new Set();
   for (const rows of Object.values(grouped)) {
-    for (const [ym] of rows) {
-      allYm.add(ym);
+    for (const [label] of rows) {
+      labels.add(label);
     }
   }
-  return Array.from(allYm).sort();
+  return Array.from(labels).sort(compareFn);
+}
+
+// ランキングの順位・閾値の累積差枚は数値ラベルのため、既定の
+// 文字列ソートだと負の値の大小関係が崩れる（例: "-1000" < "-2000"）。
+// 数値として比較する
+function numericLabelCompare(a, b) {
+  return a - b;
 }
 
 function pickChartColor(idx) {
   return CHART_COLOR_PALETTE[idx % CHART_COLOR_PALETTE.length];
 }
 
-function buildTrendDatasets(grouped, labels) {
+function buildLineDatasets(grouped, labels) {
   const names = Object.keys(grouped);
   const singleSeries = names.length <= 1;
 
   return names.map((name, idx) => {
     const color = pickChartColor(idx);
-    const valueByYm = new Map(grouped[name].map((row) => [row[0], row[3]]));
+    const valueByLabel = new Map(grouped[name]);
 
     return {
       label: name || "全体",
-      data: labels.map((ym) => (valueByYm.has(ym) ? valueByYm.get(ym) : null)),
+      data: labels.map((label) => (valueByLabel.has(label) ? valueByLabel.get(label) : null)),
       borderColor: color.border,
       backgroundColor: color.fill,
       tension: 0.2,
@@ -504,38 +773,275 @@ function buildTrendDatasets(grouped, labels) {
   });
 }
 
-function renderTrendChart(execResult, breakdownMode) {
-  const ctx = document.getElementById("trendChart").getContext("2d");
+function buildChartOptions() {
+  return {
+    plugins: {
+      legend: { labels: { color: CHART_TEXT_COLOR } },
+    },
+    scales: {
+      x: { ticks: { color: CHART_AXIS_COLOR }, grid: { color: CHART_GRID_COLOR } },
+      y: {
+        beginAtZero: true,
+        suggestedMax: CHART_Y_AXIS_MAX,
+        ticks: { color: CHART_AXIS_COLOR },
+        grid: { color: CHART_GRID_COLOR },
+      },
+    },
+  };
+}
 
-  if (trendChartInstance) {
-    trendChartInstance.destroy();
+function renderLineChart(target, execResult, breakdownMode, labelCompareFn) {
+  const canvas = document.getElementById(CHART_CANVAS_ID[target]);
+  const ctx = canvas.getContext("2d");
+
+  if (chartInstances[target]) {
+    chartInstances[target].destroy();
   }
 
   if (!execResult.length) {
     return;
   }
 
-  const grouped = groupRowsByMachine(execResult[0].values, breakdownMode);
-  const labels = extractSortedLabels(grouped);
-  const datasets = buildTrendDatasets(grouped, labels);
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const grouped = groupRowsBySeries(execResult[0].values, hasSeries);
+  const labels = extractSortedLabels(grouped, labelCompareFn);
+  const datasets = buildLineDatasets(grouped, labels);
 
-  trendChartInstance = new Chart(ctx, {
+  chartInstances[target] = new Chart(ctx, {
     type: "line",
     data: { labels, datasets },
-    options: {
-      plugins: {
-        legend: { labels: { color: CHART_TEXT_COLOR } },
-      },
-      scales: {
-        x: { ticks: { color: CHART_AXIS_COLOR }, grid: { color: CHART_GRID_COLOR } },
-        y: {
-          beginAtZero: true,
-          suggestedMax: CHART_Y_AXIS_MAX,
-          ticks: { color: CHART_AXIS_COLOR },
-          grid: { color: CHART_GRID_COLOR },
-        },
-      },
-    },
+    options: buildChartOptions(),
+  });
+}
+
+function renderThresholdChart(execResult, breakdownMode) {
+  renderLineChart(ChartTarget.THRESHOLD, execResult, breakdownMode, numericLabelCompare);
+}
+
+function renderTrendChart(execResult, breakdownMode) {
+  // 年月(YYYY-MM)は文字列の辞書順ソートで時系列順になるため
+  // 比較関数は既定（未指定）のままでよい
+  renderLineChart(ChartTarget.TREND, execResult, breakdownMode);
+}
+
+// ==============================
+// グラフ描画（ランキング専用・信頼区間バンド付き）
+//
+// 系列ごとに3本のデータセットを重ねる：
+//   1. 信頼区間下限（透明線、塗りなし）
+//   2. 信頼区間上限（透明線、直前のデータセットまで塗りつぶし→帯になる）
+//   3. 勝率本体（実線）
+// 凡例には帯の2本は出さず、勝率本体だけを表示する
+// ==============================
+function extractRankingLabels(grouped) {
+  const labels = new Set();
+  for (const entries of Object.values(grouped)) {
+    for (const entry of entries) {
+      labels.add(entry.rankWorst);
+    }
+  }
+  return Array.from(labels).sort(numericLabelCompare);
+}
+
+function groupRankingRowsBySeries(rows, enriched, hasSeries) {
+  const grouped = {};
+
+  rows.forEach((row, idx) => {
+    const seriesLabel = hasSeries ? row[0] : "";
+    const rankWorst = hasSeries ? row[1] : row[0];
+    const winRate = row[row.length - 1];
+    const { ciLow, ciHigh } = enriched[idx];
+
+    if (!grouped[seriesLabel]) {
+      grouped[seriesLabel] = [];
+    }
+    grouped[seriesLabel].push({ rankWorst, winRate, ciLow, ciHigh });
+  });
+
+  return grouped;
+}
+
+function buildRankingDatasets(grouped, labels) {
+  const names = Object.keys(grouped);
+  const datasets = [];
+
+  names.forEach((name, idx) => {
+    const color = pickChartColor(idx);
+    const byRank = new Map(grouped[name].map((entry) => [entry.rankWorst, entry]));
+    const pick = (field) =>
+      labels.map((rank) => (byRank.has(rank) ? byRank.get(rank)[field] : null));
+
+    datasets.push({
+      label: `${name || "全体"}（信頼区間）`,
+      data: pick("ciLow"),
+      borderColor: "transparent",
+      pointRadius: 0,
+      fill: false,
+      spanGaps: true,
+      isConfidenceBand: true,
+    });
+    datasets.push({
+      label: `${name || "全体"}（信頼区間）`,
+      data: pick("ciHigh"),
+      borderColor: "transparent",
+      backgroundColor: color.fill,
+      pointRadius: 0,
+      fill: "-1",
+      spanGaps: true,
+      isConfidenceBand: true,
+    });
+    datasets.push({
+      label: name || "全体",
+      data: pick("winRate"),
+      borderColor: color.border,
+      backgroundColor: color.fill,
+      tension: 0.2,
+      fill: false,
+      spanGaps: true,
+    });
+  });
+
+  return datasets;
+}
+
+function buildRankingChartOptions() {
+  const options = buildChartOptions();
+  options.plugins.legend.labels.filter = (item, data) =>
+    !data.datasets[item.datasetIndex].isConfidenceBand;
+  return options;
+}
+
+function renderRankingChart(rows, enriched, breakdownMode) {
+  const canvas = document.getElementById(CHART_CANVAS_ID[ChartTarget.RANKING]);
+  const ctx = canvas.getContext("2d");
+
+  if (chartInstances[ChartTarget.RANKING]) {
+    chartInstances[ChartTarget.RANKING].destroy();
+  }
+
+  if (!rows.length) {
+    return;
+  }
+
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const grouped = groupRankingRowsBySeries(rows, enriched, hasSeries);
+  const labels = extractRankingLabels(grouped);
+  const datasets = buildRankingDatasets(grouped, labels);
+
+  chartInstances[ChartTarget.RANKING] = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets },
+    options: buildRankingChartOptions(),
+  });
+}
+
+// ==============================
+// グラフ描画（月次トレンド・順位モード専用）
+//
+// 色相（系列: 機種名または設置台数グループ）と明度（順位）を
+// 分離して割り当てる。
+// 例: 系列Aのワースト1は濃い青、系列Aのワースト3は薄い青、
+//     系列Bのワースト1は濃い赤、系列Bのワースト3は薄い赤
+// ==============================
+function hexToRgb(hex) {
+  const clean = hex.replace("#", "");
+  return {
+    r: parseInt(clean.substring(0, 2), 16),
+    g: parseInt(clean.substring(2, 4), 16),
+    b: parseInt(clean.substring(4, 6), 16),
+  };
+}
+
+// ratio: 0で元の色、1で白に近づく（明度を上げて薄くする）
+function lightenColor(hex, ratio) {
+  const { r, g, b } = hexToRgb(hex);
+  const mix = (c) => Math.round(c + (255 - c) * ratio);
+  return `rgb(${mix(r)}, ${mix(g)}, ${mix(b)})`;
+}
+
+function shadeRatioForIndex(idx) {
+  return Math.min(idx * RANK_SHADE_STEP, RANK_SHADE_MAX);
+}
+
+function extractTrendRankRow(row, hasSeries) {
+  const offset = hasSeries ? 1 : 0;
+  return {
+    seriesLabel: hasSeries ? row[0] : "",
+    rank: row[offset],
+    ym: row[offset + 1],
+    winRate: row[row.length - 1],
+  };
+}
+
+function groupTrendRankRows(rows, hasSeries) {
+  const grouped = {};
+  const seriesOrder = [];
+
+  for (const rawRow of rows) {
+    const { seriesLabel, rank, ym, winRate } = extractTrendRankRow(rawRow, hasSeries);
+    const key = `${seriesLabel}\u0000${rank}`;
+
+    if (!grouped[key]) {
+      grouped[key] = { seriesLabel, rank, points: [] };
+      if (!seriesOrder.includes(seriesLabel)) {
+        seriesOrder.push(seriesLabel);
+      }
+    }
+    grouped[key].points.push([ym, winRate]);
+  }
+
+  return { grouped, seriesOrder };
+}
+
+function buildTrendRankDatasets(grouped, seriesOrder, labels) {
+  const distinctRanks = Array.from(new Set(Object.values(grouped).map((g) => g.rank))).sort(
+    (a, b) => a - b
+  );
+
+  return Object.values(grouped).map((series) => {
+    const seriesIdx = seriesOrder.indexOf(series.seriesLabel);
+    const baseColor = pickChartColor(seriesIdx);
+    const shadeRatio = shadeRatioForIndex(distinctRanks.indexOf(series.rank));
+    const lineColor = lightenColor(baseColor.border, shadeRatio);
+    const labelPrefix = series.seriesLabel ? `${series.seriesLabel} - ` : "";
+    const valueByYm = new Map(series.points);
+
+    return {
+      label: `${labelPrefix}ワースト${series.rank}`,
+      data: labels.map((ym) => (valueByYm.has(ym) ? valueByYm.get(ym) : null)),
+      borderColor: lineColor,
+      backgroundColor: lineColor,
+      tension: 0.2,
+      fill: false,
+      spanGaps: true,
+    };
+  });
+}
+
+function renderTrendRankChart(execResult, breakdownMode) {
+  const canvas = document.getElementById(CHART_CANVAS_ID[ChartTarget.TREND]);
+  const ctx = canvas.getContext("2d");
+
+  if (chartInstances[ChartTarget.TREND]) {
+    chartInstances[ChartTarget.TREND].destroy();
+  }
+
+  if (!execResult.length) {
+    return;
+  }
+
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const rows = execResult[0].values;
+  const ymColIdx = hasSeries ? 2 : 1;
+  const labels = Array.from(new Set(rows.map((r) => r[ymColIdx]))).sort();
+
+  const { grouped, seriesOrder } = groupTrendRankRows(rows, hasSeries);
+  const datasets = buildTrendRankDatasets(grouped, seriesOrder, labels);
+
+  chartInstances[ChartTarget.TREND] = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets },
+    options: buildChartOptions(),
   });
 }
 
@@ -587,6 +1093,33 @@ function setupDigitCheckboxes() {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.value = i;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(i));
+    container.appendChild(label);
+  }
+}
+
+function setupCountGroupCheckboxes() {
+  const container = document.getElementById("countGroupCheckboxes");
+  for (const bucket of MACHINE_COUNT_BUCKETS) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = bucket.label;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(bucket.label));
+    container.appendChild(label);
+  }
+}
+
+function setupTrendRankCheckboxes() {
+  const container = document.getElementById("trendRankCheckboxes");
+  for (let i = TREND_RANK_MIN; i <= TREND_RANK_MAX; i++) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = i;
+    input.checked = i === DEFAULT_TREND_RANK;
     label.appendChild(input);
     label.appendChild(document.createTextNode(i));
     container.appendChild(label);
@@ -701,10 +1234,12 @@ function setupHandlers() {
 // ==============================
 window.addEventListener("DOMContentLoaded", async () => {
   setupDigitCheckboxes();
+  setupCountGroupCheckboxes();
+  setupTrendRankCheckboxes();
   setupTabs();
   setupHandlers();
   setFilterSidebarState(SidebarState.CLOSED);
   setStatus("SQLiteエンジンを初期化しています...");
   await SqlDriver.init();
-  setStatus("左のボタンからhall_data.dbをアップロードしてください。");
+  setStatus("左上のボタンからhall_data.dbを選択してください。");
 });

@@ -313,3 +313,9 @@ button:disabled {
 input[type="date"]::-webkit-calendar-picker-indicator {
   filter: invert(1);
 }
+
+/* 件数(n)が少ない行は参考値として文字を薄く表示する */
+.result-table tbody tr.low-confidence td {
+  color: var(--text-secondary);
+  font-style: italic;
+}
