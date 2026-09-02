@@ -442,7 +442,11 @@ function buildRankingFragment(axis) {
   const innerSeriesSelect = axis ? `${axis.column} AS series_label,` : "";
   const outerSeriesSelect = axis ? "series_label," : "";
   const seriesGroupBy = axis ? "series_label, " : "";
-  const partitionBy = axis ? "series_label, rank_worst" : "rank_worst";
+  // ROW_NUMBER()/COUNT()のPARTITION BYは、同じSELECT文内で定義した
+  // 出力エイリアス(series_label)を参照できない（ウィンドウ関数は
+  // FROM句時点の実列だけを見て評価されるため）。そのため実列名
+  // (axis.column＝machine_nameまたはcount_group)を直接指定する
+  const partitionBy = axis ? `${axis.column}, rank_worst` : "rank_worst";
   const whereClause = axis ? `WHERE ${axis.filterSql}` : "";
 
   return `
