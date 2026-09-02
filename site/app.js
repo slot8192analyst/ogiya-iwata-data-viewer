@@ -15,8 +15,16 @@ const CHART_Y_AXIS_MAX = 100;
 // Wilson score interval・差枚の正規近似信頼区間、共に95%を採用するz値
 const Z_SCORE_95 = 1.96;
 
-// 件数(n)がこれ未満の行は参考値として表示を弱める
-const MIN_RELIABLE_N = 30;
+// 件数(n)がこれ未満の行は参考値として表示を弱める。
+// 統計的に「正しい」境界値があるわけではなく運用上の目安。
+// 実データを見て違和感があれば調整してよい
+const MIN_RELIABLE_N = 20;
+
+// 総合スコアの重み。勝率・平均差枚・差枚中央値はいずれも
+// 「値が大きいほど良い」で向きが揃っているため符号反転は不要。
+// 現時点ではどの指標が将来の勝敗をよく予測するか未検証のため、
+// まず均等重みで試し、後のバックテストで調整する
+const SCORE_WEIGHTS = { winRate: 1, avgDiff: 1, medianDiff: 1 };
 
 // 閾値分析の対象範囲（累積差枚）と選択可能な刻み幅
 const THRESHOLD_RANGE_MIN = -30000;
@@ -56,7 +64,7 @@ const BreakdownMode = { AGGREGATE: "aggregate", BY_SERIES: "by_series" };
 // ランキング結果テーブルの並び順。グラフのx軸は常に順位順で固定する
 // （順位が上がるほど勝率がどう変化するかという「傾向」を見せるための
 // ものなので、並び替え対象は表のみに限定する設計判断）
-const RankingSortMode = { RANK: "rank", CONFIDENCE: "confidence" };
+const RankingSortMode = { RANK: "rank", CONFIDENCE: "confidence", SCORE: "score" };
 
 // フィルタサイドパネルの開閉状態
 const SidebarState = { OPEN: "open", CLOSED: "closed" };
@@ -148,6 +156,34 @@ const WilsonScore = (() => {
   }
 
   return { computeInterval };
+})();
+
+// ==============================
+// ZScore: 複数指標のスケールを揃えるための標準化のみを担当する統計層。
+// 勝率(0~100)と差枚(数千~数万)のようにスケールが大きく異なる指標を
+// そのまま足し合わせると、桁の大きい指標だけがスコアを支配してしまう
+// ため、各指標を平均0・標準偏差1に変換してから合成する。
+// ==============================
+const ZScore = (() => {
+  function computeStats(values) {
+    const n = values.length;
+    if (n === 0) {
+      return { mean: 0, std: 0 };
+    }
+    const mean = values.reduce((sum, v) => sum + v, 0) / n;
+    const variance = values.reduce((sum, v) => sum + (v - mean) * (v - mean), 0) / n;
+    return { mean, std: Math.sqrt(variance) };
+  }
+
+  // std=0（全行が同一値で差がつけられない）場合は0を返す
+  function standardize(value, stats) {
+    if (stats.std === 0) {
+      return 0;
+    }
+    return (value - stats.mean) / stats.std;
+  }
+
+  return { computeStats, standardize };
 })();
 
 // タブごとのChartインスタンス。再描画時にdestroy()するために保持する
@@ -502,16 +538,31 @@ function computeDiffConfidenceInterval(avgDiff, variance, n) {
   return { low: avgDiff - margin, high: avgDiff + margin, se };
 }
 
-// 列の並びは常に固定:
+// SQLの生の行を構造化する。列の並びは常に固定:
 // [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff, diff_variance]
 // 列追加でrow.length基準のインデックスが崩れるため、hasSeriesによる
 // 固定オフセットで位置を決める
-function enrichRankingRow(row, hasSeries) {
+function parseRankingRow(row, hasSeries) {
   const offset = hasSeries ? 1 : 0;
-  const n = row[offset + 2];
-  const wins = row[offset + 3];
-  const avgDiff = row[offset + 5];
-  const diffVariance = row[offset + 7];
+  return {
+    hasSeries,
+    seriesLabel: hasSeries ? row[0] : "",
+    rankWorst: row[offset],
+    avgGroupSize: row[offset + 1],
+    n: row[offset + 2],
+    wins: row[offset + 3],
+    winRate: row[offset + 4],
+    avgDiff: row[offset + 5],
+    medianDiff: row[offset + 6],
+    diffVariance: row[offset + 7],
+  };
+}
+
+// 各行を信頼区間・z-score・総合スコア付きに拡張する。
+// statsByFieldは表示中の全行を対象に計算した平均・標準偏差
+// （renderRankingResultsで一度だけ計算して全行に共通で渡す）
+function enrichRankingRow(parsed, statsByField) {
+  const { n, wins, winRate, avgDiff, medianDiff, diffVariance } = parsed;
 
   const { low, high } = WilsonScore.computeInterval(wins, n);
   const ciLabel = `${low.toFixed(ROUND_DECIMALS)}% ~ ${high.toFixed(ROUND_DECIMALS)}%`;
@@ -521,49 +572,76 @@ function enrichRankingRow(row, hasSeries) {
     ? `${diffCi.low.toFixed(ROUND_DECIMALS)} ~ ${diffCi.high.toFixed(ROUND_DECIMALS)}`
     : "算出不可(n=1)";
 
+  // 勝率・平均差枚・差枚中央値はいずれも「値が大きいほど良い」で
+  // 向きが揃っているため、符号反転なしでそのまま加算できる
+  const zWinRate = ZScore.standardize(winRate, statsByField.winRate);
+  const zAvgDiff = ZScore.standardize(avgDiff, statsByField.avgDiff);
+  const zMedianDiff = ZScore.standardize(medianDiff, statsByField.medianDiff);
+
+  const totalScore =
+    SCORE_WEIGHTS.winRate * zWinRate +
+    SCORE_WEIGHTS.avgDiff * zAvgDiff +
+    SCORE_WEIGHTS.medianDiff * zMedianDiff;
+
   return {
-    tableRow: buildRankingTableRow(row, hasSeries, ciLabel, diffCiLabel),
+    tableRow: buildRankingTableRow(parsed, ciLabel, diffCiLabel, totalScore),
     ciLow: low,
     ciHigh: high,
+    totalScore,
     isReliable: n >= MIN_RELIABLE_N,
   };
 }
 
 // 表示用の並びを組み立てる。SQLの生の列順とは別に、
-// 「勝率の隣に勝率CI」「平均差枚の隣に平均差枚CI」となるよう
-// 明示的に並べ替える（diff_varianceは内部計算専用のため表には出さない）
-function buildRankingTableRow(row, hasSeries, ciLabel, diffCiLabel) {
-  const offset = hasSeries ? 1 : 0;
-  const seriesPart = hasSeries ? [row[0]] : [];
+// 「勝率の隣に勝率CI」「平均差枚の隣に平均差枚CI」「末尾に総合スコア」
+// となるよう明示的に並べ替える（diff_varianceは内部計算専用のため
+// 表には出さない）
+function buildRankingTableRow(parsed, ciLabel, diffCiLabel, totalScore) {
+  const seriesPart = parsed.hasSeries ? [parsed.seriesLabel] : [];
 
   return [
     ...seriesPart,
-    row[offset],       // rank_worst
-    row[offset + 1],   // avg_group_size
-    row[offset + 2],   // n
-    row[offset + 3],   // wins
-    row[offset + 4],   // win_rate
-    ciLabel,           // 信頼区間(勝率,95%)
-    row[offset + 5],   // avg_diff
-    diffCiLabel,        // 平均差枚 信頼区間(95%)
-    row[offset + 6],   // median_diff
+    parsed.rankWorst,
+    parsed.avgGroupSize,
+    parsed.n,
+    parsed.wins,
+    parsed.winRate,
+    ciLabel,
+    parsed.avgDiff,
+    diffCiLabel,
+    parsed.medianDiff,
+    totalScore.toFixed(2),
   ];
 }
 
-// 信頼度順は「CI下限が高い順」で表の行だけを並べ替える。
-// 順位順（SQLのORDER BYそのまま）ならソート不要でそのまま返す
+// 表の並び替え。順位順（SQLのORDER BYそのまま）ならソート不要でそのまま返し、
+// 信頼度順は「CI下限が高い順」、スコア順は「総合スコアが高い順」で並べる
 function sortEnrichedForTable(enriched, sortMode) {
-  if (sortMode !== RankingSortMode.CONFIDENCE) {
-    return enriched;
+  if (sortMode === RankingSortMode.CONFIDENCE) {
+    return [...enriched].sort((a, b) => b.ciLow - a.ciLow);
   }
-  return [...enriched].sort((a, b) => b.ciLow - a.ciLow);
+  if (sortMode === RankingSortMode.SCORE) {
+    return [...enriched].sort((a, b) => b.totalScore - a.totalScore);
+  }
+  return enriched;
 }
 
 // SQL結果(rows)からテーブル・グラフを再構築する。DBへの再クエリを
 // 伴わないため、並び順切り替えなど表示だけの変更に使う
 function renderRankingResults(rows, breakdownMode) {
   const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
-  const enriched = rows.map((row) => enrichRankingRow(row, hasSeries));
+  const parsedRows = rows.map((row) => parseRankingRow(row, hasSeries));
+
+  // z-score化のための平均・標準偏差は、現在表示中の全行（信頼度に
+  // 関わらず全行）を対象に計算する。信頼度が低い行の影響を除きたい
+  // 場合は、将来的にn>=MIN_RELIABLE_Nの行だけに絞る方針へ変更する
+  const statsByField = {
+    winRate: ZScore.computeStats(parsedRows.map((p) => p.winRate)),
+    avgDiff: ZScore.computeStats(parsedRows.map((p) => p.avgDiff)),
+    medianDiff: ZScore.computeStats(parsedRows.map((p) => p.medianDiff)),
+  };
+
+  const enriched = parsedRows.map((parsed) => enrichRankingRow(parsed, statsByField));
 
   const sortMode = document.getElementById("rankingSortMode").value;
   const sortedForTable = sortEnrichedForTable(enriched, sortMode);
@@ -582,6 +660,7 @@ function renderRankingResults(rows, breakdownMode) {
         "平均差枚",
         "平均差枚 信頼区間(95%)",
         "差枚中央値",
+        "総合スコア",
       ]
     : [
         "ワースト順位",
@@ -593,6 +672,7 @@ function renderRankingResults(rows, breakdownMode) {
         "平均差枚",
         "平均差枚 信頼区間(95%)",
         "差枚中央値",
+        "総合スコア",
       ];
 
   renderTable("rankingTable", tableRows, headers, rowClassFn);
