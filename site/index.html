@@ -70,6 +70,7 @@
   <button class="tab-btn active" data-tab="ranking">ランキング別勝率</button>
   <button class="tab-btn" data-tab="threshold">閾値別勝率</button>
   <button class="tab-btn" data-tab="trend">月次トレンド</button>
+  <button class="tab-btn" data-tab="correlation">順位効果ランキング</button>
 </nav>
 
 <section class="panel tab-panel active" id="tab-ranking">
@@ -144,6 +145,18 @@
       <table id="trendTable" class="result-table"></table>
     </details>
     <canvas id="trendChart" height="120"></canvas>
+  </div>
+</section>
+
+<section class="panel tab-panel" id="tab-correlation">
+  <h2>順位効果ランキング</h2>
+  <p>直近1年間のデータ（共通フィルタの対象期間とは独立・日付末尾フィルタとルックバック日数のみ共通フィルタに従う）を対象に、機種ごと・設置台数グループごとに「ワースト順位が下（累積差枚が低い）ほど勝ちやすいか」を順位相関係数で測定します。機種フィルタ・設置台数グループフィルタの選択状態には影響されず、常に全件が対象です。順位効果の強さがプラスに大きいほど、ワースト順位が下の台を狙う戦略がその機種（グループ）で機能しやすいことを示します。順位の種類数が少ない機種（グループ）は参考値として「算出不可」表示になります。</p>
+  <button id="runCorrelationBtn">分析実行</button>
+  <div class="result-area">
+    <h3>機種別</h3>
+    <table id="machineCorrelationTable" class="result-table"></table>
+    <h3>設置台数グループ別</h3>
+    <table id="countGroupCorrelationTable" class="result-table"></table>
   </div>
 </section>
 

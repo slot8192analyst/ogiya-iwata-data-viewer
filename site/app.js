@@ -95,6 +95,17 @@ const CHART_COLOR_PALETTE = [
   { border: "#845ef7", fill: "rgba(132,94,247,0.15)" },
 ];
 
+// 順位効果相関分析の対象期間(直近1年固定・共通フィルタの
+// 対象期間とは独立。「今の傾向」を見たいという要望に基づく)
+const CORRELATION_LOOKBACK_YEARS = 1;
+
+// 相関計算に使う最小データ点数(その機種/グループで観測された
+// ワースト順位の種類数)。統計的に厳密な閾値ではなく、
+// 点が少なすぎる相関係数は信用できないための足切り
+const MIN_CORRELATION_POINTS = 4;
+
+const CorrelationAxisColumn = { MACHINE: "machine_name", COUNT_GROUP: "count_group" };
+
 // ==============================
 // SqlDriver: sql.jsの直接操作をここに閉じ込める抽象化層
 // ==============================
@@ -184,6 +195,65 @@ const ZScore = (() => {
   }
 
   return { computeStats, standardize };
+})();
+
+// ==============================
+// SpearmanCorrelation: 2つの数列の順位相関係数のみを担当する統計層。
+// 値そのものではなく「順位」で相関を見るため、外れ値の影響を
+// 受けにくい(Pearsonの相関係数より頑健)。
+// 例: 大当たりが1回だけ極端に多かった月があっても、
+// 順位に変換してしまえば影響が抑えられる
+// ==============================
+const SpearmanCorrelation = (() => {
+  // 同順位(タイ)がある場合は平均順位を割り当てる
+  function toRanks(values) {
+    const indexed = values.map((value, idx) => ({ value, idx }));
+    indexed.sort((a, b) => a.value - b.value);
+
+    const ranks = new Array(values.length);
+    let i = 0;
+    while (i < indexed.length) {
+      let j = i;
+      while (j + 1 < indexed.length && indexed[j + 1].value === indexed[i].value) {
+        j++;
+      }
+      const averageRank = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) {
+        ranks[indexed[k].idx] = averageRank;
+      }
+      i = j + 1;
+    }
+    return ranks;
+  }
+
+  function pearson(xs, ys) {
+    const n = xs.length;
+    const meanX = xs.reduce((sum, v) => sum + v, 0) / n;
+    const meanY = ys.reduce((sum, v) => sum + v, 0) / n;
+
+    let cov = 0;
+    let varX = 0;
+    let varY = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = xs[i] - meanX;
+      const dy = ys[i] - meanY;
+      cov += dx * dy;
+      varX += dx * dx;
+      varY += dy * dy;
+    }
+
+    // 分散0(全点が同じ値)の場合は相関を定義できないため0扱いにする
+    if (varX === 0 || varY === 0) {
+      return 0;
+    }
+    return cov / Math.sqrt(varX * varY);
+  }
+
+  function compute(xs, ys) {
+    return pearson(toRanks(xs), toRanks(ys));
+  }
+
+  return { compute };
 })();
 
 // タブごとのChartインスタンス。再描画時にdestroy()するために保持する
@@ -875,6 +945,160 @@ function runTrendAnalysis() {
 }
 
 // ==============================
+// 分析4: 順位効果ランキング(機種・設置台数グループ別の相関分析)
+//
+// これまでの手作業での前半/後半見比べで、「ワースト順位が下ほど
+// 勝ちやすい」傾向は一部の機種でのみ確認できた(全機種共通の法則
+// ではない)。この傾向を機種・グループごとに自動判定するための分析。
+// フィルタパネルの機種フィルタ・設置台数グループフィルタの選択状態
+// には影響されず、常に全機種・全グループを対象に集計する
+// ==============================
+
+// ISO日付文字列(YYYY-MM-DD)をnYear分シフトする
+function shiftYears(isoDate, years) {
+  const d = new Date(isoDate);
+  d.setFullYear(d.getFullYear() + years);
+  return d.toISOString().slice(0, 10);
+}
+
+// 相関計算の対象期間(データ末尾からCORRELATION_LOOKBACK_YEARS年分)を
+// 解決する。共通フィルタのstartDate/endDateとは独立
+function resolveCorrelationDateRange() {
+  const res = SqlDriver.query("SELECT MAX(date) AS max_d FROM hall_data");
+  if (!res.length || !res[0].values.length) {
+    return null;
+  }
+  const maxDate = res[0].values[0][0];
+  return { startDate: shiftYears(maxDate, -CORRELATION_LOOKBACK_YEARS), endDate: maxDate };
+}
+
+// 機種・設置台数グループ共通の相関計算用集計フラグメント。
+// axisによる絞り込みは行わず、columnそのものをGROUP BYの対象にして
+// 存在するすべての値を一度に集計する
+function buildCorrelationFragment(column) {
+  return `
+    SELECT
+      ${column} AS group_key,
+      rank_worst,
+      COUNT(*) AS n,
+      ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate,
+      ROUND(AVG(target_diff), ${ROUND_DECIMALS}) AS avg_diff
+    FROM joined
+    GROUP BY group_key, rank_worst
+  `;
+}
+
+function queryCorrelationRows(cte, column) {
+  const sql = `${cte} ${buildCorrelationFragment(column)} ORDER BY group_key, rank_worst;`;
+  const res = SqlDriver.query(sql);
+  return res.length ? res[0].values : [];
+}
+
+// group_key(機種名または設置台数グループラベル)ごとに行をまとめる
+function groupCorrelationRowsByKey(rows) {
+  const grouped = new Map();
+  for (const [groupKey, rankWorst, n, winRate, avgDiff] of rows) {
+    if (!grouped.has(groupKey)) {
+      grouped.set(groupKey, []);
+    }
+    grouped.get(groupKey).push({ rankWorst, n, winRate, avgDiff });
+  }
+  return grouped;
+}
+
+// group_keyごとに「ワースト順位が下ほど有利」という仮説の
+// 強さを1つの数値にまとめる。
+// correlation(rank_worst, 指標)が負であるほど仮説を支持するため、
+// 符号反転して「強さ(正の値ほど仮説を支持)」として扱う。
+// 点数不足(MIN_CORRELATION_POINTS未満)の場合はnullを返す
+function computeRankEffectStrength(entries) {
+  if (entries.length < MIN_CORRELATION_POINTS) {
+    return null;
+  }
+
+  const rankWorsts = entries.map((e) => e.rankWorst);
+  const winRates = entries.map((e) => e.winRate);
+  const avgDiffs = entries.map((e) => e.avgDiff);
+
+  const winRateCorr = SpearmanCorrelation.compute(rankWorsts, winRates);
+  const avgDiffCorr = SpearmanCorrelation.compute(rankWorsts, avgDiffs);
+
+  return {
+    winRateCorr,
+    avgDiffCorr,
+    strength: -(winRateCorr + avgDiffCorr) / 2,
+  };
+}
+
+function computeCorrelationResults(rows) {
+  const grouped = groupCorrelationRowsByKey(rows);
+  const results = [];
+
+  for (const [groupKey, entries] of grouped) {
+    const totalN = entries.reduce((sum, e) => sum + e.n, 0);
+    const effect = computeRankEffectStrength(entries);
+    results.push({ groupKey, pointCount: entries.length, totalN, effect });
+  }
+
+  // 算出不可の行は末尾に、それ以外は強さが高い順に並べる
+  return results.sort((a, b) => {
+    const strengthA = a.effect ? a.effect.strength : -Infinity;
+    const strengthB = b.effect ? b.effect.strength : -Infinity;
+    return strengthB - strengthA;
+  });
+}
+
+function buildCorrelationTableRow(result) {
+  if (!result.effect) {
+    return [result.groupKey, result.pointCount, result.totalN, "算出不可(順位種類数不足)", "-", "-"];
+  }
+  const { winRateCorr, avgDiffCorr, strength } = result.effect;
+  return [
+    result.groupKey,
+    result.pointCount,
+    result.totalN,
+    strength.toFixed(2),
+    winRateCorr.toFixed(2),
+    avgDiffCorr.toFixed(2),
+  ];
+}
+
+function renderCorrelationResults(tableId, results, keyLabel) {
+  const headers = [keyLabel, "順位の種類数", "合計件数", "順位効果の強さ", "勝率との相関", "平均差枚との相関"];
+  renderTable(tableId, results.map(buildCorrelationTableRow), headers);
+}
+
+function runCorrelationAnalysis() {
+  const range = resolveCorrelationDateRange();
+  if (!range) {
+    alert("データが読み込まれていません。");
+    return;
+  }
+
+  const digitBoxes = document.querySelectorAll("#digitCheckboxes input:checked");
+  const dayDigits = Array.from(digitBoxes).map((el) => el.value);
+  const lookbackDays =
+    parseInt(document.getElementById("lookbackDays").value, 10) || DEFAULT_LOOKBACK_DAYS;
+
+  const cte = buildBaseCte({
+    dayDigits,
+    lookbackDays,
+    startDate: range.startDate,
+    endDate: range.endDate,
+  });
+
+  const machineResults = computeCorrelationResults(
+    queryCorrelationRows(cte, CorrelationAxisColumn.MACHINE)
+  );
+  const groupResults = computeCorrelationResults(
+    queryCorrelationRows(cte, CorrelationAxisColumn.COUNT_GROUP)
+  );
+
+  renderCorrelationResults("machineCorrelationTable", machineResults, "機種");
+  renderCorrelationResults("countGroupCorrelationTable", groupResults, "設置台数グループ");
+}
+
+// ==============================
 // 表描画
 // ==============================
 function renderTable(elementId, rows, headerLabels, rowClassFn = null) {
@@ -1436,6 +1660,13 @@ function setupHandlers() {
     const isRank = e.target.value === TrendMode.RANK;
     document.getElementById("trendRankField").style.display = isRank ? "" : "none";
     document.getElementById("trendThresholdField").style.display = isRank ? "none" : "";
+  });
+
+  document.getElementById("runCorrelationBtn").addEventListener("click", (e) => {
+    if (!guardDbReady()) {
+      return;
+    }
+    runWithIndicator(e.target, runCorrelationAnalysis);
   });
 
   document.getElementById("filterToggleBtn").addEventListener("click", toggleFilterSidebar);
