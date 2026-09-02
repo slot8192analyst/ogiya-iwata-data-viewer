@@ -12,7 +12,7 @@ const PERCENT_MULTIPLIER = 100.0;
 const ROUND_DECIMALS = 1;
 const CHART_Y_AXIS_MAX = 100;
 
-// Wilson score intervalの信頼水準95%に対応するz値
+// Wilson score interval・差枚の正規近似信頼区間、共に95%を採用するz値
 const Z_SCORE_95 = 1.96;
 
 // 件数(n)がこれ未満の行は参考値として表示を弱める
@@ -438,6 +438,16 @@ function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate }) {
 // window関数トリックで算出する。
 // rn IN ((cnt+1)/2, (cnt+2)/2) は整数除算により
 // 奇数件数なら中央1件、偶数件数なら中央2件の平均を指す
+//
+// 平均差枚の分散(diff_variance)も同様にSQL側で計算しておく。
+// SQLiteにはSTDEV/VARIANCEの組み込み関数がないため、
+// s^2 = (Σx^2 - n*mean^2) / (n-1) の展開形をSUM/AVG/COUNTだけで
+// 計算する。平方根(標準誤差)を取る部分はsql.jsのSQRT対応状況に
+// 依存させたくないため、JS側（computeDiffConfidenceInterval）で行う。
+// n=1のときは分散が定義できないためNULLにする。
+//
+// 差枚中央値の信頼区間は、正規近似のような単純な式が使えず
+// 本来ブートストラップ法などが必要になるため、今回は対象外とする
 function buildRankingFragment(axis) {
   const innerSeriesSelect = axis ? `${axis.column} AS series_label,` : "";
   const outerSeriesSelect = axis ? "series_label," : "";
@@ -458,7 +468,12 @@ function buildRankingFragment(axis) {
       SUM(is_win) AS wins,
       ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate,
       ROUND(AVG(target_diff), ${ROUND_DECIMALS}) AS avg_diff,
-      ROUND(AVG(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN target_diff END), ${ROUND_DECIMALS}) AS median_diff
+      ROUND(AVG(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN target_diff END), ${ROUND_DECIMALS}) AS median_diff,
+      CASE
+        WHEN COUNT(*) > 1 THEN
+          (SUM(target_diff * target_diff) - COUNT(*) * AVG(target_diff) * AVG(target_diff)) / (COUNT(*) - 1)
+        ELSE NULL
+      END AS diff_variance
     FROM (
       SELECT
         ${innerSeriesSelect}
@@ -472,23 +487,67 @@ function buildRankingFragment(axis) {
   `;
 }
 
+// 平均差枚の95%信頼区間。正規分布への近似（勝率のWilson区間と
+// 同じ発想）のため、nが極端に小さい場合や差枚分布が大きく歪んで
+// いる場合は実態より狭い区間になりうる点に注意。
+// n<=1で分散が定義できない場合はnullを返す
+function computeDiffConfidenceInterval(avgDiff, variance, n) {
+  if (variance === null || n <= 1) {
+    return null;
+  }
+  // 浮動小数の丸め誤差でわずかに負になるケースの保険
+  const safeVariance = Math.max(0, variance);
+  const se = Math.sqrt(safeVariance / n);
+  const margin = Z_SCORE_95 * se;
+  return { low: avgDiff - margin, high: avgDiff + margin, se };
+}
+
 // 列の並びは常に固定:
-// [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff]
+// [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff, diff_variance]
 // 列追加でrow.length基準のインデックスが崩れるため、hasSeriesによる
 // 固定オフセットで位置を決める
 function enrichRankingRow(row, hasSeries) {
   const offset = hasSeries ? 1 : 0;
   const n = row[offset + 2];
   const wins = row[offset + 3];
+  const avgDiff = row[offset + 5];
+  const diffVariance = row[offset + 7];
+
   const { low, high } = WilsonScore.computeInterval(wins, n);
   const ciLabel = `${low.toFixed(ROUND_DECIMALS)}% ~ ${high.toFixed(ROUND_DECIMALS)}%`;
 
+  const diffCi = computeDiffConfidenceInterval(avgDiff, diffVariance, n);
+  const diffCiLabel = diffCi
+    ? `${diffCi.low.toFixed(ROUND_DECIMALS)} ~ ${diffCi.high.toFixed(ROUND_DECIMALS)}`
+    : "算出不可(n=1)";
+
   return {
-    tableRow: [...row, ciLabel],
+    tableRow: buildRankingTableRow(row, hasSeries, ciLabel, diffCiLabel),
     ciLow: low,
     ciHigh: high,
     isReliable: n >= MIN_RELIABLE_N,
   };
+}
+
+// 表示用の並びを組み立てる。SQLの生の列順とは別に、
+// 「勝率の隣に勝率CI」「平均差枚の隣に平均差枚CI」となるよう
+// 明示的に並べ替える（diff_varianceは内部計算専用のため表には出さない）
+function buildRankingTableRow(row, hasSeries, ciLabel, diffCiLabel) {
+  const offset = hasSeries ? 1 : 0;
+  const seriesPart = hasSeries ? [row[0]] : [];
+
+  return [
+    ...seriesPart,
+    row[offset],       // rank_worst
+    row[offset + 1],   // avg_group_size
+    row[offset + 2],   // n
+    row[offset + 3],   // wins
+    row[offset + 4],   // win_rate
+    ciLabel,           // 信頼区間(勝率,95%)
+    row[offset + 5],   // avg_diff
+    diffCiLabel,        // 平均差枚 信頼区間(95%)
+    row[offset + 6],   // median_diff
+  ];
 }
 
 // 信頼度順は「CI下限が高い順」で表の行だけを並べ替える。
@@ -512,8 +571,29 @@ function renderRankingResults(rows, breakdownMode) {
   const rowClassFn = (idx) => (sortedForTable[idx].isReliable ? null : "low-confidence");
 
   const headers = hasSeries
-    ? ["系列", "ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "平均差枚", "差枚中央値", "信頼区間(95%)"]
-    : ["ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "平均差枚", "差枚中央値", "信頼区間(95%)"];
+    ? [
+        "系列",
+        "ワースト順位",
+        "平均設置台数",
+        "件数",
+        "勝ち数",
+        "勝率(%)",
+        "信頼区間(勝率,95%)",
+        "平均差枚",
+        "平均差枚 信頼区間(95%)",
+        "差枚中央値",
+      ]
+    : [
+        "ワースト順位",
+        "平均設置台数",
+        "件数",
+        "勝ち数",
+        "勝率(%)",
+        "信頼区間(勝率,95%)",
+        "平均差枚",
+        "平均差枚 信頼区間(95%)",
+        "差枚中央値",
+      ];
 
   renderTable("rankingTable", tableRows, headers, rowClassFn);
 
@@ -898,9 +978,8 @@ function extractRankingLabels(grouped) {
   return Array.from(labels).sort(numericLabelCompare);
 }
 
-// 列の並びは常に固定:
-// [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff]
-// hasSeriesによる固定オフセットでwin_rateの位置を特定する
+// グラフに使うのは勝率（win_rate）とその信頼区間のみのため、
+// ここではグラフ用の抽出だけを行う。表示用の並びとは無関係
 function groupRankingRowsBySeries(rows, enriched, hasSeries) {
   const grouped = {};
   const offset = hasSeries ? 1 : 0;
