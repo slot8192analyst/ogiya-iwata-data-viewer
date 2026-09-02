@@ -53,6 +53,11 @@ const TrendMode = { RANK: "rank", THRESHOLD: "threshold" };
 // 系列を単純に並べて重ね描きする（クロス集計ではない）
 const BreakdownMode = { AGGREGATE: "aggregate", BY_SERIES: "by_series" };
 
+// ランキング結果テーブルの並び順。グラフのx軸は常に順位順で固定する
+// （順位が上がるほど勝率がどう変化するかという「傾向」を見せるための
+// ものなので、並び替え対象は表のみに限定する設計判断）
+const RankingSortMode = { RANK: "rank", CONFIDENCE: "confidence" };
+
 // フィルタサイドパネルの開閉状態
 const SidebarState = { OPEN: "open", CLOSED: "closed" };
 
@@ -151,6 +156,10 @@ const chartInstances = {
   [ChartTarget.THRESHOLD]: null,
   [ChartTarget.TREND]: null,
 };
+
+// ランキング分析の直前のSQL結果。並び順切り替え時にDBへ再クエリせず
+// JS側の再ソート・再描画だけで反映するためのキャッシュ
+let lastRankingResult = null;
 
 // 勝ちの定義。基準変更時はここだけ書き換える
 function winCaseExpression() {
@@ -424,30 +433,49 @@ function buildBaseCte({ dayDigits, lookbackDays, startDate, endDate }) {
 // ==============================
 // 分析1: ランキング別勝率
 // ==============================
+
+// 中央値はSQLiteに標準関数がないため、ROW_NUMBER/COUNTの
+// window関数トリックで算出する。
+// rn IN ((cnt+1)/2, (cnt+2)/2) は整数除算により
+// 奇数件数なら中央1件、偶数件数なら中央2件の平均を指す
 function buildRankingFragment(axis) {
-  const seriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const innerSeriesSelect = axis ? `${axis.column} AS series_label,` : "";
+  const outerSeriesSelect = axis ? "series_label," : "";
   const seriesGroupBy = axis ? "series_label, " : "";
+  const partitionBy = axis ? "series_label, rank_worst" : "rank_worst";
   const whereClause = axis ? `WHERE ${axis.filterSql}` : "";
 
   return `
     SELECT
-      ${seriesSelect}
+      ${outerSeriesSelect}
       rank_worst,
       ROUND(AVG(group_size), ${ROUND_DECIMALS}) AS avg_group_size,
       COUNT(*) AS n,
       SUM(is_win) AS wins,
-      ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate
-    FROM joined
-    ${whereClause}
+      ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate,
+      ROUND(AVG(target_diff), ${ROUND_DECIMALS}) AS avg_diff,
+      ROUND(AVG(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN target_diff END), ${ROUND_DECIMALS}) AS median_diff
+    FROM (
+      SELECT
+        ${innerSeriesSelect}
+        rank_worst, group_size, is_win, target_diff,
+        ROW_NUMBER() OVER (PARTITION BY ${partitionBy} ORDER BY target_diff) AS rn,
+        COUNT(*) OVER (PARTITION BY ${partitionBy}) AS cnt
+      FROM joined
+      ${whereClause}
+    )
     GROUP BY ${seriesGroupBy}rank_worst
   `;
 }
 
-// SQL結果の末尾3列は常に n, wins, win_rate（機種軸の有無に関わらず
-// 固定の並び）。ここにWilson信頼区間と参考値フラグを付加する
-function enrichRankingRow(row) {
-  const wins = row[row.length - 2];
-  const n = row[row.length - 3];
+// 列の並びは常に固定:
+// [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff]
+// 列追加でrow.length基準のインデックスが崩れるため、hasSeriesによる
+// 固定オフセットで位置を決める
+function enrichRankingRow(row, hasSeries) {
+  const offset = hasSeries ? 1 : 0;
+  const n = row[offset + 2];
+  const wins = row[offset + 3];
   const { low, high } = WilsonScore.computeInterval(wins, n);
   const ciLabel = `${low.toFixed(ROUND_DECIMALS)}% ~ ${high.toFixed(ROUND_DECIMALS)}%`;
 
@@ -457,6 +485,36 @@ function enrichRankingRow(row) {
     ciHigh: high,
     isReliable: n >= MIN_RELIABLE_N,
   };
+}
+
+// 信頼度順は「CI下限が高い順」で表の行だけを並べ替える。
+// 順位順（SQLのORDER BYそのまま）ならソート不要でそのまま返す
+function sortEnrichedForTable(enriched, sortMode) {
+  if (sortMode !== RankingSortMode.CONFIDENCE) {
+    return enriched;
+  }
+  return [...enriched].sort((a, b) => b.ciLow - a.ciLow);
+}
+
+// SQL結果(rows)からテーブル・グラフを再構築する。DBへの再クエリを
+// 伴わないため、並び順切り替えなど表示だけの変更に使う
+function renderRankingResults(rows, breakdownMode) {
+  const hasSeries = breakdownMode === BreakdownMode.BY_SERIES;
+  const enriched = rows.map((row) => enrichRankingRow(row, hasSeries));
+
+  const sortMode = document.getElementById("rankingSortMode").value;
+  const sortedForTable = sortEnrichedForTable(enriched, sortMode);
+  const tableRows = sortedForTable.map((e) => e.tableRow);
+  const rowClassFn = (idx) => (sortedForTable[idx].isReliable ? null : "low-confidence");
+
+  const headers = hasSeries
+    ? ["系列", "ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "平均差枚", "差枚中央値", "信頼区間(95%)"]
+    : ["ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "平均差枚", "差枚中央値", "信頼区間(95%)"];
+
+  renderTable("rankingTable", tableRows, headers, rowClassFn);
+
+  // グラフは常に順位順で描画する（並び替え対象は表のみ）
+  renderRankingChart(rows, enriched, breakdownMode);
 }
 
 function runRankingAnalysis() {
@@ -474,16 +532,8 @@ function runRankingAnalysis() {
   const res = SqlDriver.query(sql);
   const rows = res.length ? res[0].values : [];
 
-  const enriched = rows.map(enrichRankingRow);
-  const tableRows = enriched.map((e) => e.tableRow);
-  const rowClassFn = (idx) => (enriched[idx].isReliable ? null : "low-confidence");
-
-  const headers = hasSeries
-    ? ["系列", "ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "信頼区間(95%)"]
-    : ["ワースト順位", "平均設置台数", "件数", "勝ち数", "勝率(%)", "信頼区間(95%)"];
-
-  renderTable("rankingTable", tableRows, headers, rowClassFn);
-  renderRankingChart(rows, enriched, breakdownMode);
+  lastRankingResult = { rows, breakdownMode };
+  renderRankingResults(rows, breakdownMode);
 }
 
 // ==============================
@@ -831,7 +881,8 @@ function renderTrendChart(execResult, breakdownMode) {
 //   1. 信頼区間下限（透明線、塗りなし）
 //   2. 信頼区間上限（透明線、直前のデータセットまで塗りつぶし→帯になる）
 //   3. 勝率本体（実線）
-// 凡例には帯の2本は出さず、勝率本体だけを表示する
+// 凡例には帯の2本は出さず、勝率本体だけを表示する。
+// x軸は常に順位順（並び替え対象は表のみ）
 // ==============================
 function extractRankingLabels(grouped) {
   const labels = new Set();
@@ -843,13 +894,17 @@ function extractRankingLabels(grouped) {
   return Array.from(labels).sort(numericLabelCompare);
 }
 
+// 列の並びは常に固定:
+// [series_label?, rank_worst, avg_group_size, n, wins, win_rate, avg_diff, median_diff]
+// hasSeriesによる固定オフセットでwin_rateの位置を特定する
 function groupRankingRowsBySeries(rows, enriched, hasSeries) {
   const grouped = {};
+  const offset = hasSeries ? 1 : 0;
 
   rows.forEach((row, idx) => {
     const seriesLabel = hasSeries ? row[0] : "";
-    const rankWorst = hasSeries ? row[1] : row[0];
-    const winRate = row[row.length - 1];
+    const rankWorst = row[offset];
+    const winRate = row[offset + 4];
     const { ciLow, ciHigh } = enriched[idx];
 
     if (!grouped[seriesLabel]) {
@@ -1189,6 +1244,15 @@ function setupHandlers() {
       return;
     }
     runWithIndicator(e.target, runRankingAnalysis);
+  });
+
+  // 並び順の切り替えはDBへ再クエリせず、直前の結果をキャッシュから
+  // 再ソート・再描画するだけで済ませる
+  document.getElementById("rankingSortMode").addEventListener("change", () => {
+    if (!lastRankingResult) {
+      return;
+    }
+    renderRankingResults(lastRankingResult.rows, lastRankingResult.breakdownMode);
   });
 
   document.getElementById("runThresholdBtn").addEventListener("click", (e) => {
