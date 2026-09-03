@@ -70,7 +70,6 @@
   <button class="tab-btn active" data-tab="ranking">ランキング別勝率</button>
   <button class="tab-btn" data-tab="threshold">閾値別勝率</button>
   <button class="tab-btn" data-tab="trend">月次トレンド</button>
-  <button class="tab-btn" data-tab="correlation">順位効果ランキング</button>
   <button class="tab-btn" data-tab="combo">複合条件スコア探索</button>
 </nav>
 
@@ -149,18 +148,6 @@
   </div>
 </section>
 
-<section class="panel tab-panel" id="tab-correlation">
-  <h2>順位効果ランキング</h2>
-  <p>直近1年間のデータ（共通フィルタの対象期間とは独立・日付末尾フィルタとルックバック日数のみ共通フィルタに従う）を対象に、機種ごと・設置台数グループごとに「ワースト順位が下（累積差枚が低い）ほど勝ちやすいか」を順位相関係数で測定します。機種フィルタ・設置台数グループフィルタの選択状態には影響されず、常に全件が対象です。順位効果の強さがプラスに大きいほど、ワースト順位が下の台を狙う戦略がその機種（グループ）で機能しやすいことを示します。順位の種類数が少ない機種（グループ）は参考値として「算出不可」表示になります。</p>
-  <button id="runCorrelationBtn">分析実行</button>
-  <div class="result-area">
-    <h3>機種別</h3>
-    <table id="machineCorrelationTable" class="result-table"></table>
-    <h3>設置台数グループ別</h3>
-    <table id="countGroupCorrelationTable" class="result-table"></table>
-  </div>
-</section>
-
 <section class="panel tab-panel" id="tab-combo">
   <h2>複合条件スコア探索</h2>
   <p>機種×累積差枚に関する条件×ルックバック日数の組み合わせを総当たりし、勝率スコアの高い組み合わせを探索します。機種フィルタ・設置台数グループフィルタの選択状態には影響されず、常に全機種が対象です。共通フィルタの対象日の日付末尾・対象期間はここでも適用されます。対象期間の最終日にその機種が設置されているかどうかで、結果を2つのテーブルに分けて表示します。件数（n）が少ない組み合わせは偶然良く見えやすいため、指定した最低件数未満の組み合わせは最初から候補から除外します。組み合わせの数が多いほど偶然良い結果が混ざりやすくなるため、並び順は信頼区間下限を主軸にすることを推奨します。</p>
@@ -170,11 +157,9 @@
   <div class="field">
     <label>探索パターン（切り替えると結果はクリアされます）</label>
     <div class="radio-list" id="comboPatternRadios">
-      <label><input type="radio" name="comboPattern" value="rank_worst" checked /> 累積差枚順位のみ（ワースト側）</label>
-      <label><input type="radio" name="comboPattern" value="rank_top" /> 累積差枚順位のみ（TOP側）</label>
+      <label><input type="radio" name="comboPattern" value="rank" checked /> 累積差枚順位のみ（💀ワースト・👑TOPを1テーブルに表示）</label>
       <label><input type="radio" name="comboPattern" value="threshold" /> 累積差枚しきい値のみ</label>
-      <label><input type="radio" name="comboPattern" value="combined_worst" /> 複合（ワースト順位×しきい値）</label>
-      <label><input type="radio" name="comboPattern" value="combined_top" /> 複合（TOP順位×しきい値）</label>
+      <label><input type="radio" name="comboPattern" value="combined" /> 複合（順位×しきい値、💀・👑を1テーブルに表示）</label>
     </div>
   </div>
 

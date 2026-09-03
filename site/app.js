@@ -95,17 +95,6 @@ const CHART_COLOR_PALETTE = [
   { border: "#845ef7", fill: "rgba(132,94,247,0.15)" },
 ];
 
-// 順位効果相関分析の対象期間(直近1年固定・共通フィルタの
-// 対象期間とは独立。「今の傾向」を見たいという要望に基づく)
-const CORRELATION_LOOKBACK_YEARS = 1;
-
-// 相関計算に使う最小データ点数(その機種/グループで観測された
-// ワースト順位の種類数)。統計的に厳密な閾値ではなく、
-// 点が少なすぎる相関係数は信用できないための足切り
-const MIN_CORRELATION_POINTS = 4;
-
-const CorrelationAxisColumn = { MACHINE: "machine_name", COUNT_GROUP: "count_group" };
-
 // 複合条件スコア探索: ルックバック日数の候補範囲、最低件数の
 // デフォルト、並び順の選択肢
 const COMBO_LOOKBACK_MIN = 1;
@@ -121,16 +110,29 @@ const ComboSortMode = { CONFIDENCE: "confidence", SCORE: "score" };
 const COMBO_RANK_MIN = 1;
 const COMBO_RANK_MAX = 5;
 
-// 複合条件スコア探索: 5つの探索パターン。
-//   rank_worst/rank_top   … 累積差枚の相対順位のみ（しきい値は使わない）
-//   threshold              … 累積差枚のしきい値のみ（従来の集計方式）
-//   combined_worst/top     … 相対順位×しきい値ビンの複合集計
+// 複合条件スコア探索: 3つの探索パターン。
+//   rank      … 累積差枚の相対順位のみ（しきい値は使わない）
+//   threshold … 累積差枚のしきい値のみ（従来の集計方式）
+//   combined  … 相対順位×しきい値ビンの複合集計
+// いずれも「順位」を使うパターンでは、ワースト側(💀)・TOP側(👑)を
+// UNION ALLで合流させ、1つの結果テーブルにまとめて表示する
 const ComboPatternMode = {
-  RANK_WORST: "rank_worst",
-  RANK_TOP: "rank_top",
+  RANK: "rank",
   THRESHOLD: "threshold",
-  COMBINED_WORST: "combined_worst",
-  COMBINED_TOP: "combined_top",
+  COMBINED: "combined",
+};
+
+// 累積差枚の相対順位を「ワースト(💀)」「TOP(👑)」のどちらから見るかの
+// 区別。1回の探索で両方向をUNION ALLし、1つの結果テーブルに合流させる
+// ための識別子とラベル・参照列の対応
+const ComboRankDirection = { WORST: "worst", TOP: "top" };
+const COMBO_RANK_DIRECTION_LABEL = {
+  [ComboRankDirection.WORST]: "💀",
+  [ComboRankDirection.TOP]: "👑",
+};
+const COMBO_RANK_DIRECTION_COLUMN = {
+  [ComboRankDirection.WORST]: "rank_worst",
+  [ComboRankDirection.TOP]: "rank_best",
 };
 
 // 累積差枚の相対順位判定で使う「設置台数→対象順位数」の対応。
@@ -232,65 +234,6 @@ const ZScore = (() => {
   }
 
   return { computeStats, standardize };
-})();
-
-// ==============================
-// SpearmanCorrelation: 2つの数列の順位相関係数のみを担当する統計層。
-// 値そのものではなく「順位」で相関を見るため、外れ値の影響を
-// 受けにくい(Pearsonの相関係数より頑健)。
-// 例: 大当たりが1回だけ極端に多かった月があっても、
-// 順位に変換してしまえば影響が抑えられる
-// ==============================
-const SpearmanCorrelation = (() => {
-  // 同順位(タイ)がある場合は平均順位を割り当てる
-  function toRanks(values) {
-    const indexed = values.map((value, idx) => ({ value, idx }));
-    indexed.sort((a, b) => a.value - b.value);
-
-    const ranks = new Array(values.length);
-    let i = 0;
-    while (i < indexed.length) {
-      let j = i;
-      while (j + 1 < indexed.length && indexed[j + 1].value === indexed[i].value) {
-        j++;
-      }
-      const averageRank = (i + j) / 2 + 1;
-      for (let k = i; k <= j; k++) {
-        ranks[indexed[k].idx] = averageRank;
-      }
-      i = j + 1;
-    }
-    return ranks;
-  }
-
-  function pearson(xs, ys) {
-    const n = xs.length;
-    const meanX = xs.reduce((sum, v) => sum + v, 0) / n;
-    const meanY = ys.reduce((sum, v) => sum + v, 0) / n;
-
-    let cov = 0;
-    let varX = 0;
-    let varY = 0;
-    for (let i = 0; i < n; i++) {
-      const dx = xs[i] - meanX;
-      const dy = ys[i] - meanY;
-      cov += dx * dy;
-      varX += dx * dx;
-      varY += dy * dy;
-    }
-
-    // 分散0(全点が同じ値)の場合は相関を定義できないため0扱いにする
-    if (varX === 0 || varY === 0) {
-      return 0;
-    }
-    return cov / Math.sqrt(varX * varY);
-  }
-
-  function compute(xs, ys) {
-    return pearson(toRanks(xs), toRanks(ys));
-  }
-
-  return { compute };
 })();
 
 // タブごとのChartインスタンス。再描画時にdestroy()するために保持する
@@ -987,177 +930,25 @@ function runTrendAnalysis() {
 }
 
 // ==============================
-// 分析4: 順位効果ランキング(機種・設置台数グループ別の相関分析)
-//
-// これまでの手作業での前半/後半見比べで、「ワースト順位が下ほど
-// 勝ちやすい」傾向は一部の機種でのみ確認できた(全機種共通の法則
-// ではない)。この傾向を機種・グループごとに自動判定するための分析。
-// フィルタパネルの機種フィルタ・設置台数グループフィルタの選択状態
-// には影響されず、常に全機種・全グループを対象に集計する
-// ==============================
-
-// ISO日付文字列(YYYY-MM-DD)をnYear分シフトする
-function shiftYears(isoDate, years) {
-  const d = new Date(isoDate);
-  d.setFullYear(d.getFullYear() + years);
-  return d.toISOString().slice(0, 10);
-}
-
-// 相関計算の対象期間(データ末尾からCORRELATION_LOOKBACK_YEARS年分)を
-// 解決する。共通フィルタのstartDate/endDateとは独立
-function resolveCorrelationDateRange() {
-  const res = SqlDriver.query("SELECT MAX(date) AS max_d FROM hall_data");
-  if (!res.length || !res[0].values.length) {
-    return null;
-  }
-  const maxDate = res[0].values[0][0];
-  return { startDate: shiftYears(maxDate, -CORRELATION_LOOKBACK_YEARS), endDate: maxDate };
-}
-
-// 機種・設置台数グループ共通の相関計算用集計フラグメント。
-// axisによる絞り込みは行わず、columnそのものをGROUP BYの対象にして
-// 存在するすべての値を一度に集計する
-function buildCorrelationFragment(column) {
-  return `
-    SELECT
-      ${column} AS group_key,
-      rank_worst,
-      COUNT(*) AS n,
-      ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate,
-      ROUND(AVG(target_diff), ${ROUND_DECIMALS}) AS avg_diff
-    FROM joined
-    GROUP BY group_key, rank_worst
-  `;
-}
-
-function queryCorrelationRows(cte, column) {
-  const sql = `${cte} ${buildCorrelationFragment(column)} ORDER BY group_key, rank_worst;`;
-  const res = SqlDriver.query(sql);
-  return res.length ? res[0].values : [];
-}
-
-// group_key(機種名または設置台数グループラベル)ごとに行をまとめる
-function groupCorrelationRowsByKey(rows) {
-  const grouped = new Map();
-  for (const [groupKey, rankWorst, n, winRate, avgDiff] of rows) {
-    if (!grouped.has(groupKey)) {
-      grouped.set(groupKey, []);
-    }
-    grouped.get(groupKey).push({ rankWorst, n, winRate, avgDiff });
-  }
-  return grouped;
-}
-
-// group_keyごとに「ワースト順位が下ほど有利」という仮説の
-// 強さを1つの数値にまとめる。
-// correlation(rank_worst, 指標)が負であるほど仮説を支持するため、
-// 符号反転して「強さ(正の値ほど仮説を支持)」として扱う。
-// 点数不足(MIN_CORRELATION_POINTS未満)の場合はnullを返す
-function computeRankEffectStrength(entries) {
-  if (entries.length < MIN_CORRELATION_POINTS) {
-    return null;
-  }
-
-  const rankWorsts = entries.map((e) => e.rankWorst);
-  const winRates = entries.map((e) => e.winRate);
-  const avgDiffs = entries.map((e) => e.avgDiff);
-
-  const winRateCorr = SpearmanCorrelation.compute(rankWorsts, winRates);
-  const avgDiffCorr = SpearmanCorrelation.compute(rankWorsts, avgDiffs);
-
-  return {
-    winRateCorr,
-    avgDiffCorr,
-    strength: -(winRateCorr + avgDiffCorr) / 2,
-  };
-}
-
-function computeCorrelationResults(rows) {
-  const grouped = groupCorrelationRowsByKey(rows);
-  const results = [];
-
-  for (const [groupKey, entries] of grouped) {
-    const totalN = entries.reduce((sum, e) => sum + e.n, 0);
-    const effect = computeRankEffectStrength(entries);
-    results.push({ groupKey, pointCount: entries.length, totalN, effect });
-  }
-
-  // 算出不可の行は末尾に、それ以外は強さが高い順に並べる
-  return results.sort((a, b) => {
-    const strengthA = a.effect ? a.effect.strength : -Infinity;
-    const strengthB = b.effect ? b.effect.strength : -Infinity;
-    return strengthB - strengthA;
-  });
-}
-
-function buildCorrelationTableRow(result) {
-  if (!result.effect) {
-    return [result.groupKey, result.pointCount, result.totalN, "算出不可(順位種類数不足)", "-", "-"];
-  }
-  const { winRateCorr, avgDiffCorr, strength } = result.effect;
-  return [
-    result.groupKey,
-    result.pointCount,
-    result.totalN,
-    strength.toFixed(2),
-    winRateCorr.toFixed(2),
-    avgDiffCorr.toFixed(2),
-  ];
-}
-
-function renderCorrelationResults(tableId, results, keyLabel) {
-  const headers = [keyLabel, "順位の種類数", "合計件数", "順位効果の強さ", "勝率との相関", "平均差枚との相関"];
-  renderTable(tableId, results.map(buildCorrelationTableRow), headers);
-}
-
-function runCorrelationAnalysis() {
-  const range = resolveCorrelationDateRange();
-  if (!range) {
-    alert("データが読み込まれていません。");
-    return;
-  }
-
-  const digitBoxes = document.querySelectorAll("#digitCheckboxes input:checked");
-  const dayDigits = Array.from(digitBoxes).map((el) => el.value);
-  const lookbackDays =
-    parseInt(document.getElementById("lookbackDays").value, 10) || DEFAULT_LOOKBACK_DAYS;
-
-  const cte = buildBaseCte({
-    dayDigits,
-    lookbackDays,
-    startDate: range.startDate,
-    endDate: range.endDate,
-  });
-
-  const machineResults = computeCorrelationResults(
-    queryCorrelationRows(cte, CorrelationAxisColumn.MACHINE)
-  );
-  const groupResults = computeCorrelationResults(
-    queryCorrelationRows(cte, CorrelationAxisColumn.COUNT_GROUP)
-  );
-
-  renderCorrelationResults("machineCorrelationTable", machineResults, "機種");
-  renderCorrelationResults("countGroupCorrelationTable", groupResults, "設置台数グループ");
-}
-
-// ==============================
-// 分析5: 複合条件スコア探索(機種×累積差枚条件×ルックバック日数)
+// 分析4: 複合条件スコア探索(機種×累積差枚条件×ルックバック日数)
 //
 // 最終目的は「機種×累積差枚条件×ルックバック日数の組み合わせで
 // 勝率スコアの高いものを見つける」こと。ここでは機種軸のみを対象に、
 // 選択された複数のルックバック日数それぞれでCTEを作り直してクエリし、
 // 結果をJS側で合流させる。
 //
-// 累積差枚条件は5パターンから切り替え式で選ぶ:
-//   1. 累積差枚の相対順位のみ（ワースト側/TOP側）
+// 累積差枚条件は3パターンから切り替え式で選ぶ:
+//   1. 累積差枚の相対順位のみ
 //      → 対象日と同じ日の同機種内で、ルックバック期間の累積差枚が
-//        何番目に悪い/良いかを見る。設置台数に応じた対象順位数
-//        (target_n)を「その日において意味のある順位の上限」として
-//        残しつつ、ユーザーが選択した個別の順位（1位、2位…）ごとに
-//        行を分けて集計する（ワースト1位とワースト2位の違いを
-//        直接比較できるようにするため）
+//        何番目に悪い(💀ワースト)/良い(👑TOP)かを見る。設置台数に
+//        応じた対象順位数(target_n)を「その日において意味のある
+//        順位の上限」として残しつつ、ユーザーが選択した個別の順位
+//        （1位、2位…）ごとに行を分けて集計する。💀と👑は別々の
+//        パターンではなく、常に両方をUNION ALLし1つの結果テーブルに
+//        合流させる（ワースト1位とTOP1位の違いを直接比較できる
+//        ようにするため）
 //   2. 累積差枚のしきい値のみ（従来方式）
-//   3. 複合（個別順位×しきい値ビン）
+//   3. 複合（個別順位×しきい値ビン。順位側も💀・👑両方を合流）
 //
 // どのパターンも同じ`joined`テーブル(group_size・rank_worst・
 // rank_best・cum_diffを持つ)を土台にしているため、集計方法だけを
@@ -1176,9 +967,8 @@ function getSelectedComboLookbacks() {
 }
 
 // 累積差枚順位を使うパターンで、結果テーブルに個別の行として
-// 表示したい順位(1位、2位…)の集合。ワースト側/TOP側どちらの
-// パターンでも同じチェックボックス群を共有し、どちら向きかは
-// getSelectedComboPatternMode側のラジオボタンで決まる
+// 表示したい順位(1位、2位…)の集合。💀ワースト・👑TOPどちらの方向にも
+// 同じチェックボックス群を共有する
 function getSelectedComboRanks() {
   const boxes = document.querySelectorAll("#comboRankCheckboxes input:checked");
   return Array.from(boxes)
@@ -1193,27 +983,12 @@ function getSelectedComboPatternMode() {
 
 // パターンが「しきい値ビン」を使うかどうか
 function comboPatternUsesBin(mode) {
-  return (
-    mode === ComboPatternMode.THRESHOLD ||
-    mode === ComboPatternMode.COMBINED_WORST ||
-    mode === ComboPatternMode.COMBINED_TOP
-  );
+  return mode === ComboPatternMode.THRESHOLD || mode === ComboPatternMode.COMBINED;
 }
 
 // パターンが「累積差枚の相対順位」を使うかどうか
 function comboPatternUsesRank(mode) {
-  return (
-    mode === ComboPatternMode.RANK_WORST ||
-    mode === ComboPatternMode.RANK_TOP ||
-    mode === ComboPatternMode.COMBINED_WORST ||
-    mode === ComboPatternMode.COMBINED_TOP
-  );
-}
-
-// ワースト側かTOP側かに応じて参照する順位列を切り替える
-function comboPatternRankColumn(mode) {
-  const isTopSide = mode === ComboPatternMode.RANK_TOP || mode === ComboPatternMode.COMBINED_TOP;
-  return isTopSide ? "rank_best" : "rank_worst";
+  return mode === ComboPatternMode.RANK || mode === ComboPatternMode.COMBINED;
 }
 
 // 設置台数(group_size)から対象順位数(target_n)を求めるCASE式。
@@ -1226,10 +1001,11 @@ function buildTargetNCaseExpression(groupSizeColumn) {
   return `CASE ${whenClauses.join(" ")} ELSE NULL END`;
 }
 
-// 機種×(累積差枚の相対順位・個別)×(累積差枚のしきい値ビン)の
+// 機種×(累積差枚の相対順位・個別・単一方向)×(累積差枚のしきい値ビン)の
 // 集計フラグメント。機種フィルタの選択状態には影響されず、常に
-// 全機種をGROUP BYの対象にする(順位効果ランキングのbuildCorrelationFragment
-// と同じ考え方)。
+// 全機種をGROUP BYの対象にする。
+// direction(💀ワースト/👑TOP)がnullの場合は順位を使わないパターン
+// （しきい値のみ）として扱う。
 //
 // SQLは3段階のサブクエリに分けている:
 //   level1: joinedの実列(group_size・rank_worst/rank_best・cum_diff)
@@ -1240,10 +1016,11 @@ function buildTargetNCaseExpression(groupSizeColumn) {
 //           満たす行だけに絞り込む(1台設置日はtarget_n=NULLのため除外)
 //   level3: 中央値計算用のROW_NUMBER/COUNTウィンドウを、最終的な
 //           GROUP BY対象と同じ単位で付与
-function buildComboRankFragment(mode, step, ranks) {
+function buildComboSingleDirectionFragment(mode, step, ranks, direction) {
   const usesBin = comboPatternUsesBin(mode);
-  const usesRank = comboPatternUsesRank(mode);
-  const rankColumn = comboPatternRankColumn(mode);
+  const usesRank = direction !== null;
+  const rankColumn = usesRank ? COMBO_RANK_DIRECTION_COLUMN[direction] : null;
+  const directionLabel = usesRank ? COMBO_RANK_DIRECTION_LABEL[direction] : null;
   const targetNExpr = buildTargetNCaseExpression("group_size");
   const binIndexExpr = `CAST(FLOOR((cum_diff - (${THRESHOLD_RANGE_MIN})) / ${step}) AS INTEGER)`;
 
@@ -1322,6 +1099,10 @@ function buildComboRankFragment(mode, step, ranks) {
 
   const outerSelectParts = [
     "machine_name",
+    // ワースト(💀)/TOP(👑)を判別するための固定ラベル文字列。
+    // テーブルの実列ではなくSQLリテラルとして埋め込むため、
+    // GROUP BYには含めなくてよい（この1フラグメント内では常に一定）
+    usesRank ? `'${directionLabel}' AS rank_direction` : null,
     usesRank ? "rank_value" : null,
     usesBin ? `${binLowerExpr} AS bin_lower` : null,
     usesBin ? `${binUpperExpr} AS bin_upper` : null,
@@ -1341,8 +1122,23 @@ function buildComboRankFragment(mode, step, ranks) {
   `;
 }
 
-// SQL結果の列レイアウトはパターンによって(rank_value・bin_lower/upperの
-// 有無が)変わるため、モードを見て可変長にパースする
+// 順位を使うパターンでは、💀ワースト側・👑TOP側それぞれの集計を
+// UNION ALLで合流させ、1つの結果テーブルとして返す。
+// 順位を使わないパターン（しきい値のみ）ではdirection=nullの
+// 単一フラグメントのみを返す
+function buildComboRankFragment(mode, step, ranks) {
+  const usesRank = comboPatternUsesRank(mode);
+  if (!usesRank) {
+    return buildComboSingleDirectionFragment(mode, step, ranks, null);
+  }
+
+  return [ComboRankDirection.WORST, ComboRankDirection.TOP]
+    .map((direction) => buildComboSingleDirectionFragment(mode, step, ranks, direction))
+    .join(" UNION ALL ");
+}
+
+// SQL結果の列レイアウトはパターンによって(rank_direction・rank_value・
+// bin_lower/upperの有無が)変わるため、モードを見て可変長にパースする
 function queryComboRankRows(cte, mode, step, ranks, lookbackDays) {
   const sql = `${cte} ${buildComboRankFragment(mode, step, ranks)};`;
   const res = SqlDriver.query(sql);
@@ -1353,6 +1149,7 @@ function queryComboRankRows(cte, mode, step, ranks, lookbackDays) {
   return rows.map((row) => {
     let idx = 0;
     const machineName = row[idx++];
+    const rankDirection = usesRank ? row[idx++] : null;
     const rankValue = usesRank ? row[idx++] : null;
     const binLower = usesBin ? row[idx++] : null;
     const binUpper = usesBin ? row[idx++] : null;
@@ -1366,6 +1163,7 @@ function queryComboRankRows(cte, mode, step, ranks, lookbackDays) {
     return {
       machineName,
       lookbackDays,
+      rankDirection,
       rankValue,
       binLower,
       binUpper,
@@ -1443,14 +1241,6 @@ function comboTableHeaders(mode) {
   return headers;
 }
 
-// 実際の順位の数値(rank_value)を、ワースト側/TOP側それぞれの
-// 文言に変換する（例: ワースト側でrank_value=2なら「ワースト2」）
-function comboRankConditionLabel(mode, rankValue) {
-  const isWorstSide = mode === ComboPatternMode.RANK_WORST || mode === ComboPatternMode.COMBINED_WORST;
-  const label = isWorstSide ? "ワースト" : "TOP";
-  return `${label}${rankValue}`;
-}
-
 function buildComboTableRow(row, mode) {
   const ciLabel = `${row.ciLow.toFixed(ROUND_DECIMALS)}% ~ ${row.ciHigh.toFixed(ROUND_DECIMALS)}%`;
   const usesRank = comboPatternUsesRank(mode);
@@ -1458,7 +1248,9 @@ function buildComboTableRow(row, mode) {
 
   const cells = [row.machineName, row.lookbackDays];
   if (usesRank) {
-    cells.push(comboRankConditionLabel(mode, row.rankValue));
+    // rank_directionには既に💀または👑がSQL側で埋め込まれているため、
+    // そのまま順位の数値と連結するだけでよい（例: 💀1、👑3）
+    cells.push(`${row.rankDirection}${row.rankValue}`);
   }
   if (usesBin) {
     cells.push(row.binLower, row.binUpper);
@@ -2141,13 +1933,6 @@ function setupHandlers() {
     const isRank = e.target.value === TrendMode.RANK;
     document.getElementById("trendRankField").style.display = isRank ? "" : "none";
     document.getElementById("trendThresholdField").style.display = isRank ? "none" : "";
-  });
-
-  document.getElementById("runCorrelationBtn").addEventListener("click", (e) => {
-    if (!guardDbReady()) {
-      return;
-    }
-    runWithIndicator(e.target, runCorrelationAnalysis);
   });
 
   document.getElementById("runComboBtn").addEventListener("click", (e) => {
