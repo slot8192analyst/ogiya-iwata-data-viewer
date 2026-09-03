@@ -106,6 +106,43 @@ const MIN_CORRELATION_POINTS = 4;
 
 const CorrelationAxisColumn = { MACHINE: "machine_name", COUNT_GROUP: "count_group" };
 
+// 複合条件スコア探索: ルックバック日数の候補範囲、最低件数の
+// デフォルト、並び順の選択肢
+const COMBO_LOOKBACK_MIN = 1;
+const COMBO_LOOKBACK_MAX = 10;
+const DEFAULT_COMBO_MIN_N = 30;
+const ComboSortMode = { CONFIDENCE: "confidence", SCORE: "score" };
+
+// 複合条件スコア探索: 累積差枚順位パターンで選択できる順位の範囲。
+// RANK_WITHIN_BUCKETSの最大targetN(5)に合わせている。
+// ここで選んだ順位(例: 1,2,3)は、後述のtarget_n（その日の設置台数
+// から見て意味を持つ順位の上限）と両方を満たす行だけが、その順位の
+// グループとして個別に集計される
+const COMBO_RANK_MIN = 1;
+const COMBO_RANK_MAX = 5;
+
+// 複合条件スコア探索: 5つの探索パターン。
+//   rank_worst/rank_top   … 累積差枚の相対順位のみ（しきい値は使わない）
+//   threshold              … 累積差枚のしきい値のみ（従来の集計方式）
+//   combined_worst/top     … 相対順位×しきい値ビンの複合集計
+const ComboPatternMode = {
+  RANK_WORST: "rank_worst",
+  RANK_TOP: "rank_top",
+  THRESHOLD: "threshold",
+  COMBINED_WORST: "combined_worst",
+  COMBINED_TOP: "combined_top",
+};
+
+// 累積差枚の相対順位判定で使う「設置台数→対象順位数」の対応。
+// 上から順に評価し、最初に条件を満たした行のtargetNを採用する
+// （10台以上→5位以内、6～9台→3位以内、2～5台→1位以内）。
+// 1台のみ設置の日はどの条件にも当たらずNULL（判定不能として除外）
+const RANK_WITHIN_BUCKETS = [
+  { min: 10, targetN: 5 },
+  { min: 6, targetN: 3 },
+  { min: 2, targetN: 1 },
+];
+
 // ==============================
 // SqlDriver: sql.jsの直接操作をここに閉じ込める抽象化層
 // ==============================
@@ -266,6 +303,11 @@ const chartInstances = {
 // ランキング分析の直前のSQL結果。並び順切り替え時にDBへ再クエリせず
 // JS側の再ソート・再描画だけで反映するためのキャッシュ
 let lastRankingResult = null;
+
+// 複合条件スコア探索の直前の集計結果（present/absentに分割・
+// enrich済み・どのパターンで計算したかを保持）。並び順切り替え時に
+// DBへ再クエリせず再ソートのみで反映するためのキャッシュ
+let lastComboResult = null;
 
 // 勝ちの定義。基準変更時はここだけ書き換える
 function winCaseExpression() {
@@ -1099,6 +1141,415 @@ function runCorrelationAnalysis() {
 }
 
 // ==============================
+// 分析5: 複合条件スコア探索(機種×累積差枚条件×ルックバック日数)
+//
+// 最終目的は「機種×累積差枚条件×ルックバック日数の組み合わせで
+// 勝率スコアの高いものを見つける」こと。ここでは機種軸のみを対象に、
+// 選択された複数のルックバック日数それぞれでCTEを作り直してクエリし、
+// 結果をJS側で合流させる。
+//
+// 累積差枚条件は5パターンから切り替え式で選ぶ:
+//   1. 累積差枚の相対順位のみ（ワースト側/TOP側）
+//      → 対象日と同じ日の同機種内で、ルックバック期間の累積差枚が
+//        何番目に悪い/良いかを見る。設置台数に応じた対象順位数
+//        (target_n)を「その日において意味のある順位の上限」として
+//        残しつつ、ユーザーが選択した個別の順位（1位、2位…）ごとに
+//        行を分けて集計する（ワースト1位とワースト2位の違いを
+//        直接比較できるようにするため）
+//   2. 累積差枚のしきい値のみ（従来方式）
+//   3. 複合（個別順位×しきい値ビン）
+//
+// どのパターンも同じ`joined`テーブル(group_size・rank_worst・
+// rank_best・cum_diffを持つ)を土台にしているため、集計方法だけを
+// 切り替える形でbuildComboRankFragmentひとつに統一している。
+//
+// 組み合わせ数が多いほど偶然良い結果(多重比較問題)が混ざりやすい
+// ため、最低件数フィルタと信頼区間下限を主軸にした並び順を
+// デフォルトとし、総合スコア順とは別に選べるようにしている
+// ==============================
+
+function getSelectedComboLookbacks() {
+  const boxes = document.querySelectorAll("#comboLookbackCheckboxes input:checked");
+  return Array.from(boxes)
+    .map((el) => parseInt(el.value, 10))
+    .sort((a, b) => a - b);
+}
+
+// 累積差枚順位を使うパターンで、結果テーブルに個別の行として
+// 表示したい順位(1位、2位…)の集合。ワースト側/TOP側どちらの
+// パターンでも同じチェックボックス群を共有し、どちら向きかは
+// getSelectedComboPatternMode側のラジオボタンで決まる
+function getSelectedComboRanks() {
+  const boxes = document.querySelectorAll("#comboRankCheckboxes input:checked");
+  return Array.from(boxes)
+    .map((el) => parseInt(el.value, 10))
+    .sort((a, b) => a - b);
+}
+
+function getSelectedComboPatternMode() {
+  const checked = document.querySelector('input[name="comboPattern"]:checked');
+  return checked ? checked.value : ComboPatternMode.THRESHOLD;
+}
+
+// パターンが「しきい値ビン」を使うかどうか
+function comboPatternUsesBin(mode) {
+  return (
+    mode === ComboPatternMode.THRESHOLD ||
+    mode === ComboPatternMode.COMBINED_WORST ||
+    mode === ComboPatternMode.COMBINED_TOP
+  );
+}
+
+// パターンが「累積差枚の相対順位」を使うかどうか
+function comboPatternUsesRank(mode) {
+  return (
+    mode === ComboPatternMode.RANK_WORST ||
+    mode === ComboPatternMode.RANK_TOP ||
+    mode === ComboPatternMode.COMBINED_WORST ||
+    mode === ComboPatternMode.COMBINED_TOP
+  );
+}
+
+// ワースト側かTOP側かに応じて参照する順位列を切り替える
+function comboPatternRankColumn(mode) {
+  const isTopSide = mode === ComboPatternMode.RANK_TOP || mode === ComboPatternMode.COMBINED_TOP;
+  return isTopSide ? "rank_best" : "rank_worst";
+}
+
+// 設置台数(group_size)から対象順位数(target_n)を求めるCASE式。
+// 上から順に評価され、最初に条件を満たした行のtargetNが採用される。
+// どの条件にも当たらない場合(1台のみ設置)はNULL(判定不能)になる
+function buildTargetNCaseExpression(groupSizeColumn) {
+  const whenClauses = RANK_WITHIN_BUCKETS.map(
+    ({ min, targetN }) => `WHEN ${groupSizeColumn} >= ${min} THEN ${targetN}`
+  );
+  return `CASE ${whenClauses.join(" ")} ELSE NULL END`;
+}
+
+// 機種×(累積差枚の相対順位・個別)×(累積差枚のしきい値ビン)の
+// 集計フラグメント。機種フィルタの選択状態には影響されず、常に
+// 全機種をGROUP BYの対象にする(順位効果ランキングのbuildCorrelationFragment
+// と同じ考え方)。
+//
+// SQLは3段階のサブクエリに分けている:
+//   level1: joinedの実列(group_size・rank_worst/rank_best・cum_diff)
+//           だけから計算できる派生列(target_n・rank_value・bin_index)を追加
+//   level2: level1のtarget_n・rank_valueを使って、「その日の設置台数
+//           から見て意味を持つ順位の上限(target_n)以内」かつ
+//           「ユーザーが表示対象として選んだ順位(ranks)」の両方を
+//           満たす行だけに絞り込む(1台設置日はtarget_n=NULLのため除外)
+//   level3: 中央値計算用のROW_NUMBER/COUNTウィンドウを、最終的な
+//           GROUP BY対象と同じ単位で付与
+function buildComboRankFragment(mode, step, ranks) {
+  const usesBin = comboPatternUsesBin(mode);
+  const usesRank = comboPatternUsesRank(mode);
+  const rankColumn = comboPatternRankColumn(mode);
+  const targetNExpr = buildTargetNCaseExpression("group_size");
+  const binIndexExpr = `CAST(FLOOR((cum_diff - (${THRESHOLD_RANGE_MIN})) / ${step}) AS INTEGER)`;
+
+  const level1SelectParts = [
+    "machine_name",
+    "target_diff",
+    "is_win",
+    usesRank ? `${targetNExpr} AS target_n` : null,
+    usesRank ? `${rankColumn} AS rank_value` : null,
+    usesBin ? `${binIndexExpr} AS bin_index` : null,
+  ].filter(Boolean).join(",\n      ");
+
+  const level1WhereClause = usesBin
+    ? `WHERE cum_diff >= (${THRESHOLD_RANGE_MIN}) AND cum_diff < (${THRESHOLD_RANGE_MAX})`
+    : "";
+
+  const level1 = `
+    SELECT
+      ${level1SelectParts}
+    FROM joined
+    ${level1WhereClause}
+  `;
+
+  const level2SelectParts = [
+    "machine_name",
+    "target_diff",
+    "is_win",
+    usesBin ? "bin_index" : null,
+    usesRank ? "rank_value" : null,
+  ].filter(Boolean).join(",\n      ");
+
+  // rank_valueは「その日の設置台数で有効な順位の上限(target_n)以内」
+  // かつ「ユーザーが表示対象として選んだ順位(ranks)」の両方を
+  // 満たす行だけを残す。1台のみ設置の日はtarget_nがNULLになるため
+  // 判定不能として除外する
+  const level2WhereParts = [];
+  if (usesRank) {
+    level2WhereParts.push("target_n IS NOT NULL");
+    level2WhereParts.push("rank_value <= target_n");
+    level2WhereParts.push(`rank_value IN (${ranks.join(",")})`);
+  }
+  const level2WhereClause = level2WhereParts.length ? `WHERE ${level2WhereParts.join(" AND ")}` : "";
+
+  const level2 = `
+    SELECT
+      ${level2SelectParts}
+    FROM (${level1})
+    ${level2WhereClause}
+  `;
+
+  const groupCols = [
+    "machine_name",
+    usesRank ? "rank_value" : null,
+    usesBin ? "bin_index" : null,
+  ].filter(Boolean);
+  const groupColsSql = groupCols.join(", ");
+
+  const level3SelectParts = [
+    "machine_name",
+    "target_diff",
+    "is_win",
+    usesRank ? "rank_value" : null,
+    usesBin ? "bin_index" : null,
+    `ROW_NUMBER() OVER (PARTITION BY ${groupColsSql} ORDER BY target_diff) AS rn`,
+    `COUNT(*) OVER (PARTITION BY ${groupColsSql}) AS cnt`,
+  ].filter(Boolean).join(",\n      ");
+
+  const level3 = `
+    SELECT
+      ${level3SelectParts}
+    FROM (${level2})
+  `;
+
+  const binLowerExpr = `bin_index * ${step} + (${THRESHOLD_RANGE_MIN})`;
+  const binUpperExpr = `${binLowerExpr} + ${step}`;
+
+  const outerSelectParts = [
+    "machine_name",
+    usesRank ? "rank_value" : null,
+    usesBin ? `${binLowerExpr} AS bin_lower` : null,
+    usesBin ? `${binUpperExpr} AS bin_upper` : null,
+    "COUNT(*) AS n",
+    "SUM(is_win) AS wins",
+    `ROUND(${PERCENT_MULTIPLIER} * SUM(is_win) / COUNT(*), ${ROUND_DECIMALS}) AS win_rate`,
+    `ROUND(AVG(target_diff), ${ROUND_DECIMALS}) AS avg_diff`,
+    `ROUND(AVG(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN target_diff END), ${ROUND_DECIMALS}) AS median_diff`,
+    `CASE WHEN COUNT(*) > 1 THEN (SUM(target_diff * target_diff) - COUNT(*) * AVG(target_diff) * AVG(target_diff)) / (COUNT(*) - 1) ELSE NULL END AS diff_variance`,
+  ].filter(Boolean).join(",\n      ");
+
+  return `
+    SELECT
+      ${outerSelectParts}
+    FROM (${level3})
+    GROUP BY ${groupColsSql}
+  `;
+}
+
+// SQL結果の列レイアウトはパターンによって(rank_value・bin_lower/upperの
+// 有無が)変わるため、モードを見て可変長にパースする
+function queryComboRankRows(cte, mode, step, ranks, lookbackDays) {
+  const sql = `${cte} ${buildComboRankFragment(mode, step, ranks)};`;
+  const res = SqlDriver.query(sql);
+  const rows = res.length ? res[0].values : [];
+  const usesRank = comboPatternUsesRank(mode);
+  const usesBin = comboPatternUsesBin(mode);
+
+  return rows.map((row) => {
+    let idx = 0;
+    const machineName = row[idx++];
+    const rankValue = usesRank ? row[idx++] : null;
+    const binLower = usesBin ? row[idx++] : null;
+    const binUpper = usesBin ? row[idx++] : null;
+    const n = row[idx++];
+    const wins = row[idx++];
+    const winRate = row[idx++];
+    const avgDiff = row[idx++];
+    const medianDiff = row[idx++];
+    const diffVariance = row[idx++];
+
+    return {
+      machineName,
+      lookbackDays,
+      rankValue,
+      binLower,
+      binUpper,
+      n,
+      wins,
+      winRate,
+      avgDiff,
+      medianDiff,
+      diffVariance,
+    };
+  });
+}
+
+// 対象期間の最終日にその機種が設置されているかどうかの判定。
+// 既存の機種フィルタ(resolveReferenceDate)と同じ基準日ロジックを流用
+function resolvePresentMachineSet(endDate) {
+  const referenceDate = resolveReferenceDate(endDate);
+  if (!referenceDate) {
+    return new Set();
+  }
+  const res = SqlDriver.query(`
+    SELECT DISTINCT machine_name
+    FROM hall_data
+    WHERE date = '${escapeSql(referenceDate)}'
+  `);
+  if (!res.length) {
+    return new Set();
+  }
+  return new Set(res[0].values.map((row) => row[0]));
+}
+
+// ランキング分析のenrichRankingRowと同じ考え方で、信頼区間・
+// z-score・総合スコアを付与する
+function enrichComboRow(row, statsByField) {
+  const { low, high } = WilsonScore.computeInterval(row.wins, row.n);
+  const zWinRate = ZScore.standardize(row.winRate, statsByField.winRate);
+  const zAvgDiff = ZScore.standardize(row.avgDiff, statsByField.avgDiff);
+  const zMedianDiff = ZScore.standardize(row.medianDiff, statsByField.medianDiff);
+  const totalScore =
+    SCORE_WEIGHTS.winRate * zWinRate +
+    SCORE_WEIGHTS.avgDiff * zAvgDiff +
+    SCORE_WEIGHTS.medianDiff * zMedianDiff;
+
+  return { ...row, ciLow: low, ciHigh: high, totalScore };
+}
+
+function sortComboRows(rows, sortMode) {
+  if (sortMode === ComboSortMode.SCORE) {
+    return [...rows].sort((a, b) => b.totalScore - a.totalScore);
+  }
+  return [...rows].sort((a, b) => b.ciLow - a.ciLow);
+}
+
+// パターンごとに表示する列構成を切り替える
+function comboTableHeaders(mode) {
+  const usesRank = comboPatternUsesRank(mode);
+  const usesBin = comboPatternUsesBin(mode);
+
+  const headers = ["機種", "ルックバック日数"];
+  if (usesRank) {
+    headers.push("順位");
+  }
+  if (usesBin) {
+    headers.push("累積差枚 下限", "累積差枚 上限（未満）");
+  }
+  headers.push(
+    "件数",
+    "勝ち数",
+    "勝率(%)",
+    "信頼区間(勝率,95%)",
+    "平均差枚",
+    "差枚中央値",
+    "総合スコア"
+  );
+  return headers;
+}
+
+// 実際の順位の数値(rank_value)を、ワースト側/TOP側それぞれの
+// 文言に変換する（例: ワースト側でrank_value=2なら「ワースト2」）
+function comboRankConditionLabel(mode, rankValue) {
+  const isWorstSide = mode === ComboPatternMode.RANK_WORST || mode === ComboPatternMode.COMBINED_WORST;
+  const label = isWorstSide ? "ワースト" : "TOP";
+  return `${label}${rankValue}`;
+}
+
+function buildComboTableRow(row, mode) {
+  const ciLabel = `${row.ciLow.toFixed(ROUND_DECIMALS)}% ~ ${row.ciHigh.toFixed(ROUND_DECIMALS)}%`;
+  const usesRank = comboPatternUsesRank(mode);
+  const usesBin = comboPatternUsesBin(mode);
+
+  const cells = [row.machineName, row.lookbackDays];
+  if (usesRank) {
+    cells.push(comboRankConditionLabel(mode, row.rankValue));
+  }
+  if (usesBin) {
+    cells.push(row.binLower, row.binUpper);
+  }
+  cells.push(row.n, row.wins, row.winRate, ciLabel, row.avgDiff, row.medianDiff, row.totalScore.toFixed(2));
+  return cells;
+}
+
+// パターン切り替え時、しきい値刻み幅の入力・順位選択のチェックボックスを
+// それぞれ使うパターンのときだけ表示する
+function updateComboPatternFieldVisibility() {
+  const mode = getSelectedComboPatternMode();
+  const usesBin = comboPatternUsesBin(mode);
+  const usesRank = comboPatternUsesRank(mode);
+  document.getElementById("comboThresholdStepField").style.display = usesBin ? "" : "none";
+  document.getElementById("comboRankField").style.display = usesRank ? "" : "none";
+}
+
+function runComboAnalysis() {
+  const lookbacks = getSelectedComboLookbacks();
+  if (lookbacks.length === 0) {
+    alert("ルックバック日数を1つ以上選択してください。");
+    return;
+  }
+
+  const mode = getSelectedComboPatternMode();
+  const usesRank = comboPatternUsesRank(mode);
+  const ranks = usesRank ? getSelectedComboRanks() : [];
+  if (usesRank && ranks.length === 0) {
+    alert("表示する順位を1つ以上選択してください。");
+    return;
+  }
+
+  const digitBoxes = document.querySelectorAll("#digitCheckboxes input:checked");
+  const dayDigits = Array.from(digitBoxes).map((el) => el.value);
+  const startDate = document.getElementById("startDate").value;
+  const endDate = document.getElementById("endDate").value;
+  const step = parseInt(document.getElementById("comboThresholdStep").value, 10) || DEFAULT_THRESHOLD_STEP;
+  const minN = parseInt(document.getElementById("comboMinN").value, 10) || DEFAULT_COMBO_MIN_N;
+
+  // ルックバック日数はbuildBaseCteのウィンドウ関数幅として埋め込まれる
+  // ため、候補ごとにCTEを作り直して個別にクエリし、JS側で合流させる
+  let allRows = [];
+  for (const lookbackDays of lookbacks) {
+    const cte = buildBaseCte({ dayDigits, lookbackDays, startDate, endDate });
+    allRows = allRows.concat(queryComboRankRows(cte, mode, step, ranks, lookbackDays));
+  }
+
+  const filteredRows = allRows.filter((r) => r.n >= minN);
+  const headers = comboTableHeaders(mode);
+
+  if (filteredRows.length === 0) {
+    renderTable("comboPresentTable", [], headers);
+    renderTable("comboAbsentTable", [], headers);
+    lastComboResult = null;
+    alert("最低件数フィルタを満たす組み合わせが見つかりませんでした。フィルタを緩めてください。");
+    return;
+  }
+
+  const statsByField = {
+    winRate: ZScore.computeStats(filteredRows.map((r) => r.winRate)),
+    avgDiff: ZScore.computeStats(filteredRows.map((r) => r.avgDiff)),
+    medianDiff: ZScore.computeStats(filteredRows.map((r) => r.medianDiff)),
+  };
+  const enriched = filteredRows.map((r) => enrichComboRow(r, statsByField));
+
+  const presentSet = resolvePresentMachineSet(endDate);
+  const presentRows = enriched.filter((r) => presentSet.has(r.machineName));
+  const absentRows = enriched.filter((r) => !presentSet.has(r.machineName));
+
+  lastComboResult = { presentRows, absentRows, mode };
+  renderComboResults();
+}
+
+// 並び順切り替え時はDBへ再クエリせず、キャッシュ済みの結果を
+// 再ソート・再描画するだけで済ませる
+function renderComboResults() {
+  if (!lastComboResult) {
+    return;
+  }
+  const { mode } = lastComboResult;
+  const sortMode = document.getElementById("comboSortMode").value;
+  const presentSorted = sortComboRows(lastComboResult.presentRows, sortMode);
+  const absentSorted = sortComboRows(lastComboResult.absentRows, sortMode);
+  const headers = comboTableHeaders(mode);
+
+  renderTable("comboPresentTable", presentSorted.map((r) => buildComboTableRow(r, mode)), headers);
+  renderTable("comboAbsentTable", absentSorted.map((r) => buildComboTableRow(r, mode)), headers);
+}
+
+// ==============================
 // 表描画
 // ==============================
 function renderTable(elementId, rows, headerLabels, rowClassFn = null) {
@@ -1568,6 +2019,36 @@ function setupTrendRankCheckboxes() {
   }
 }
 
+function setupComboLookbackCheckboxes() {
+  const container = document.getElementById("comboLookbackCheckboxes");
+  for (let i = COMBO_LOOKBACK_MIN; i <= COMBO_LOOKBACK_MAX; i++) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = i;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(`${i}日`));
+    container.appendChild(label);
+  }
+}
+
+// 累積差枚順位を使うパターンで表示したい順位(1位～5位)のチェックボックス。
+// デフォルトは全順位チェック済み（「ワースト1,2,3,4,5でどう違うか」を
+// 一度に見比べたいという要望に基づく）
+function setupComboRankCheckboxes() {
+  const container = document.getElementById("comboRankCheckboxes");
+  for (let i = COMBO_RANK_MIN; i <= COMBO_RANK_MAX; i++) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = i;
+    input.checked = true;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(`${i}位`));
+    container.appendChild(label);
+  }
+}
+
 function setupTabs() {
   const buttons = document.querySelectorAll(".tab-btn");
   for (const btn of buttons) {
@@ -1669,6 +2150,32 @@ function setupHandlers() {
     runWithIndicator(e.target, runCorrelationAnalysis);
   });
 
+  document.getElementById("runComboBtn").addEventListener("click", (e) => {
+    if (!guardDbReady()) {
+      return;
+    }
+    runWithIndicator(e.target, runComboAnalysis);
+  });
+
+  // 並び順の切り替えはDBへ再クエリせず、直前の結果をキャッシュから
+  // 再ソート・再描画するだけで済ませる
+  document.getElementById("comboSortMode").addEventListener("change", () => {
+    renderComboResults();
+  });
+
+  // 探索パターンの切り替え時は、集計方法が根本的に変わるため
+  // 直前の結果はクリアし、再度「分析実行」を押してもらう。
+  // 併せてしきい値刻み幅・順位選択チェックボックスの表示/非表示も切り替える
+  document.querySelectorAll('input[name="comboPattern"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      lastComboResult = null;
+      const headers = comboTableHeaders(getSelectedComboPatternMode());
+      renderTable("comboPresentTable", [], headers);
+      renderTable("comboAbsentTable", [], headers);
+      updateComboPatternFieldVisibility();
+    });
+  });
+
   document.getElementById("filterToggleBtn").addEventListener("click", toggleFilterSidebar);
 
   document.getElementById("filterCloseBtn").addEventListener("click", () => {
@@ -1694,9 +2201,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupDigitCheckboxes();
   setupCountGroupCheckboxes();
   setupTrendRankCheckboxes();
+  setupComboLookbackCheckboxes();
+  setupComboRankCheckboxes();
   setupTabs();
   setupHandlers();
   setFilterSidebarState(SidebarState.CLOSED);
+  updateComboPatternFieldVisibility();
   setStatus("SQLiteエンジンを初期化しています...");
   await SqlDriver.init();
   setStatus("左上のボタンからhall_data.dbを選択してください。");

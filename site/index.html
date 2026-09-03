@@ -71,6 +71,7 @@
   <button class="tab-btn" data-tab="threshold">閾値別勝率</button>
   <button class="tab-btn" data-tab="trend">月次トレンド</button>
   <button class="tab-btn" data-tab="correlation">順位効果ランキング</button>
+  <button class="tab-btn" data-tab="combo">複合条件スコア探索</button>
 </nav>
 
 <section class="panel tab-panel active" id="tab-ranking">
@@ -157,6 +158,73 @@
     <table id="machineCorrelationTable" class="result-table"></table>
     <h3>設置台数グループ別</h3>
     <table id="countGroupCorrelationTable" class="result-table"></table>
+  </div>
+</section>
+
+<section class="panel tab-panel" id="tab-combo">
+  <h2>複合条件スコア探索</h2>
+  <p>機種×累積差枚に関する条件×ルックバック日数の組み合わせを総当たりし、勝率スコアの高い組み合わせを探索します。機種フィルタ・設置台数グループフィルタの選択状態には影響されず、常に全機種が対象です。共通フィルタの対象日の日付末尾・対象期間はここでも適用されます。対象期間の最終日にその機種が設置されているかどうかで、結果を2つのテーブルに分けて表示します。件数（n）が少ない組み合わせは偶然良く見えやすいため、指定した最低件数未満の組み合わせは最初から候補から除外します。組み合わせの数が多いほど偶然良い結果が混ざりやすくなるため、並び順は信頼区間下限を主軸にすることを推奨します。</p>
+
+  <p>「累積差枚順位」は、対象日と同じ日に設置されていた同機種内で、ルックバック期間の累積差枚が何番目に悪い（ワースト）か・良い（TOP）かを順位で見る条件です。設置台数が10台以上ならワースト・TOP1~5位、6~9台なら1~3位、2~5台なら1位のみが「その日において意味のある順位」として有効になり、それを超える順位（例: 6~9台の日のワースト4・5位）は判定不能として集計から除外されます。1台のみ設置の日も同様に除外されます。下のチェックボックスで結果テーブルに表示したい順位を選ぶと、選んだ順位ごとに行が分かれて表示されるため、「ワースト1位と2位と3位でどう違うか」を直接比較できます（同着(タイ)がある場合はRANK方式のため、同じ順位のラインに複数台が並ぶことがあります）。</p>
+
+  <div class="field">
+    <label>探索パターン（切り替えると結果はクリアされます）</label>
+    <div class="radio-list" id="comboPatternRadios">
+      <label><input type="radio" name="comboPattern" value="rank_worst" checked /> 累積差枚順位のみ（ワースト側）</label>
+      <label><input type="radio" name="comboPattern" value="rank_top" /> 累積差枚順位のみ（TOP側）</label>
+      <label><input type="radio" name="comboPattern" value="threshold" /> 累積差枚しきい値のみ</label>
+      <label><input type="radio" name="comboPattern" value="combined_worst" /> 複合（ワースト順位×しきい値）</label>
+      <label><input type="radio" name="comboPattern" value="combined_top" /> 複合（TOP順位×しきい値）</label>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>ルックバック日数（複数選択・1つ以上必須）</label>
+    <div class="digit-checkboxes" id="comboLookbackCheckboxes"></div>
+  </div>
+
+  <div class="field" id="comboRankField">
+    <label>表示する順位（累積差枚順位を使うパターンのみ・ワースト/TOPの区別は上の探索パターンに従う・複数選択可）</label>
+    <div class="digit-checkboxes" id="comboRankCheckboxes"></div>
+  </div>
+
+  <div class="field-row">
+    <div class="field" id="comboThresholdStepField">
+      <label for="comboThresholdStep">累積差枚の刻み幅（しきい値を使うパターンのみ）</label>
+      <select id="comboThresholdStep">
+        <option value="500">500枚おき</option>
+        <option value="1000" selected>1000枚おき</option>
+        <option value="1500">1500枚おき</option>
+        <option value="2000">2000枚おき</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="comboMinN">最低件数(n)フィルタ</label>
+      <input type="number" id="comboMinN" value="30" min="1" />
+    </div>
+    <div class="field">
+      <label for="comboSortMode">並び順</label>
+      <select id="comboSortMode">
+        <option value="confidence" selected>信頼区間下限順（推奨）</option>
+        <option value="score">総合スコア順（暫定・均等重み）</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="runComboBtn">分析実行</button>
+
+  <div class="result-area">
+    <h3>対象期間の最終日に設置されている機種</h3>
+    <details class="result-details" open>
+      <summary>結果テーブルを表示</summary>
+      <table id="comboPresentTable" class="result-table"></table>
+    </details>
+
+    <h3>対象期間の最終日に設置されていない機種</h3>
+    <details class="result-details">
+      <summary>結果テーブルを表示</summary>
+      <table id="comboAbsentTable" class="result-table"></table>
+    </details>
   </div>
 </section>
 

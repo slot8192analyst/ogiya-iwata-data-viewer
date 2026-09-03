@@ -186,6 +186,28 @@ input::placeholder {
   color: var(--text-primary);
 }
 
+/* 複合条件スコア探索のパターン切り替えラジオボタン。
+   選択肢の文言が長いため、digit-checkboxesとは違い縦並びにする */
+.radio-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.radio-list label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-color);
+  padding: 6px 10px;
+  border-radius: 4px;
+  margin: 0;
+  cursor: pointer;
+  background: var(--input-bg);
+  color: var(--text-primary);
+  width: fit-content;
+}
+
 .link-btn {
   background: none;
   border: none;
@@ -200,6 +222,7 @@ input::placeholder {
   display: flex;
   gap: 8px;
   margin-bottom: 12px;
+  flex-wrap: wrap;
 }
 
 .tab-btn {
@@ -228,7 +251,8 @@ input::placeholder {
 button#runRankingBtn,
 button#runThresholdBtn,
 button#runTrendBtn,
-button#runCorrelationBtn {
+button#runCorrelationBtn,
+button#runComboBtn {
   background: var(--accent);
   color: #0d1117;
   border: none;
@@ -242,7 +266,8 @@ button#runCorrelationBtn {
 button#runRankingBtn:hover,
 button#runThresholdBtn:hover,
 button#runTrendBtn:hover,
-button#runCorrelationBtn:hover {
+button#runCorrelationBtn:hover,
+button#runComboBtn:hover {
   background: var(--accent-hover);
 }
 
