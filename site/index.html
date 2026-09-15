@@ -3,218 +3,211 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>パチスロ実戦データ解析（モック）</title>
+<title>パチスロ実戦データ解析</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
 <header class="app-header">
-  <div class="header-left">
-    <button id="filterToggleBtn" class="icon-btn" title="フィルタ条件" aria-label="フィルタ条件" aria-expanded="false">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4 6h16M7 12h10M10 18h4"></path>
-      </svg>
-    </button>
-    <button id="uploadBtn" class="icon-btn" title="DBファイルを開く" aria-label="DBファイルを開く">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
-      </svg>
-    </button>
-    <input type="file" id="dbFileInput" accept=".db,.sqlite,.sqlite3" hidden />
-    <span id="statusText" class="status">初期化中です...</span>
+  <div class="header-inner">
+    <div class="header-left">
+      <button id="uploadBtn" class="icon-btn" title="DBファイルを開く" aria-label="DBファイルを開く">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+        </svg>
+      </button>
+      <input type="file" id="dbFileInput" accept=".db,.sqlite,.sqlite3" hidden />
+      <span class="header-title">複合条件スコア探索</span>
+    </div>
+    <div class="header-right">
+      <span id="statusText" class="status"></span>
+    </div>
   </div>
 </header>
 
-<section class="panel sidebar-panel" id="filterPanel">
-  <div class="sidebar-panel-header">
-    <h2>共通フィルタ条件</h2>
-    <button type="button" id="filterCloseBtn" class="icon-btn" aria-label="閉じる">×</button>
-  </div>
-
-  <div class="field">
-    <label>対象日の日付末尾（複数選択可・未選択で全日）</label>
-    <div class="digit-checkboxes" id="digitCheckboxes"></div>
-  </div>
-
-  <div class="field">
-    <label for="lookbackDays">ルックバック日数（対象日を含まない直前N日間）</label>
-    <input type="number" id="lookbackDays" value="7" min="1" max="90" />
-  </div>
-
-  <div class="field-row">
-    <div class="field">
-      <label for="startDate">対象期間 開始日</label>
-      <input type="date" id="startDate" value="2026-01-01" />
+<!-- メインコンテンツ -->
+<main>
+  <!-- DBが未読み込みのときのウェルカム表示 -->
+  <div id="welcomeCard" class="welcome-card">
+    <div class="welcome-icon">
+      <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
     </div>
-    <div class="field">
-      <label for="endDate">対象期間 終了日</label>
-      <input type="date" id="endDate" value="2026-08-30" />
+    <p class="welcome-title">DBファイルを読み込んでください</p>
+    <p class="welcome-sub"><code>.db</code> ファイルを選択すると分析が始められます。</p>
+    <button id="uploadBtnMain" class="btn-primary">DBファイルを開く</button>
+  </div>
+
+  <!-- 分析パネル（DB読み込み後に表示） -->
+  <div id="comboPanel" style="display:none;">
+
+    <!-- ===== 設定エリア（折りたたみ） ===== -->
+    <div class="settings-container" id="settingsContainer">
+      <button class="settings-toggle" id="settingsToggleBtn" aria-expanded="true">
+        <span class="settings-toggle-icon">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 8v4M12 16h.01"/>
+          </svg>
+        </span>
+        <span class="settings-toggle-label">分析条件</span>
+        <span class="settings-toggle-caret" id="settingsCaret">▲</span>
+      </button>
+
+      <div class="settings-body" id="settingsBody">
+
+        <!-- フィルタ行（日付・日付末尾） -->
+        <div class="settings-section">
+          <div class="settings-section-title">共通フィルタ</div>
+          <div class="settings-inline-row">
+            <div class="field">
+              <label for="startDate">開始日</label>
+              <input type="date" id="startDate" value="2026-01-01" />
+            </div>
+            <div class="field">
+              <label for="endDate">終了日</label>
+              <input type="date" id="endDate" value="2026-08-30" />
+            </div>
+            <div class="field">
+              <label>日付末尾（未選択で全日）</label>
+              <div class="digit-checkboxes" id="digitCheckboxes"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 探索パターン -->
+        <div class="settings-section">
+          <div class="settings-section-title">探索パターン</div>
+          <div class="radio-list" id="comboPatternRadios">
+            <label><input type="radio" name="comboPattern" value="rank" checked /> 累積差枚順位のみ（💀ワースト・👑TOPを1テーブルに表示）</label>
+            <label><input type="radio" name="comboPattern" value="threshold" /> 累積差枚しきい値のみ</label>
+            <label><input type="radio" name="comboPattern" value="combined" /> 複合（順位×しきい値、💀・👑を1テーブルに表示）</label>
+          </div>
+        </div>
+
+        <!-- ルックバック日数 -->
+        <div class="settings-section">
+          <div class="settings-section-title">ルックバック日数（1つ以上必須）</div>
+          <div class="digit-checkboxes" id="comboLookbackCheckboxes"></div>
+        </div>
+
+        <!-- 表示する順位（累積差枚順位を使うパターンのみ） -->
+        <div class="settings-section" id="comboRankField">
+          <div class="settings-section-title">表示する順位（累積差枚順位を使うパターンのみ）</div>
+          <div class="digit-checkboxes" id="comboRankCheckboxes"></div>
+        </div>
+
+        <!-- 数値パラメータ行 -->
+        <div class="settings-section">
+          <div class="settings-section-title">パラメータ</div>
+          <div class="settings-inline-row">
+            <div class="field" id="comboThresholdStepField">
+              <label for="comboThresholdStep">累積差枚の刻み幅（しきい値パターンのみ）</label>
+              <select id="comboThresholdStep">
+                <option value="500">500枚おき</option>
+                <option value="1000" selected>1000枚おき</option>
+                <option value="1500">1500枚おき</option>
+                <option value="2000">2000枚おき</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="comboMinN">最低件数(n)フィルタ</label>
+              <input type="number" id="comboMinN" value="30" min="1" />
+            </div>
+            <div class="field">
+              <label for="comboSortMode">並び順</label>
+              <select id="comboSortMode">
+                <option value="confidence" selected>信頼区間下限順（推奨）</option>
+                <option value="score">総合スコア順</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- スコア重み設定 -->
+        <div class="settings-section">
+          <div class="settings-section-title">
+            総合スコアの重み付け
+            <span class="section-note">各指標をz-score化して加重合計します。0にすると除外。</span>
+          </div>
+          <div class="weight-grid">
+            <div class="weight-item">
+              <div class="weight-label">勝率</div>
+              <input type="range" id="weightWinRate" class="weight-slider" min="0" max="5" step="0.5" value="1" />
+              <span class="weight-value" id="weightWinRateVal">1.0</span>
+            </div>
+            <div class="weight-item">
+              <div class="weight-label">平均差枚</div>
+              <input type="range" id="weightAvgDiff" class="weight-slider" min="0" max="5" step="0.5" value="1" />
+              <span class="weight-value" id="weightAvgDiffVal">1.0</span>
+            </div>
+            <div class="weight-item">
+              <div class="weight-label">差枚中央値</div>
+              <input type="range" id="weightMedianDiff" class="weight-slider" min="0" max="5" step="0.5" value="1" />
+              <span class="weight-value" id="weightMedianDiffVal">1.0</span>
+            </div>
+            <div class="weight-item">
+              <div class="weight-label">信頼区間下限</div>
+              <input type="range" id="weightCiLow" class="weight-slider" min="0" max="5" step="0.5" value="0" />
+              <span class="weight-value" id="weightCiLowVal">0.0</span>
+            </div>
+          </div>
+          <p class="weight-note">※ 重みは「総合スコア順」で並べる場合にのみ反映されます。信頼区間下限順は並び順には影響しませんが、スコア列の値は常に重みを反映して計算されます。</p>
+        </div>
+
+      </div><!-- /.settings-body -->
+    </div><!-- /.settings-container -->
+
+    <!-- 実行ボタン行 -->
+    <div class="run-row">
+      <button id="runComboBtn" class="btn-primary btn-run">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+          <path d="M8 5v14l11-7z"/>
+        </svg>
+        分析実行
+      </button>
+      <button id="showSettingsBtn" class="btn-secondary" style="display:none;">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+        条件を編集
+      </button>
     </div>
-  </div>
 
-  <div class="field">
-    <label for="machineFilter">機種フィルタ（複数選択可・Ctrl/Cmdキーで複数選択、未選択で全機種）</label>
-    <select id="machineFilter" multiple size="8"></select>
-    <button type="button" id="clearMachineFilterBtn" class="link-btn">選択をクリア</button>
-  </div>
+    <!-- 結果エリア -->
+    <div class="result-area" id="comboResults" style="display:none;">
+      <div class="result-section">
+        <div class="result-section-header present">
+          <span class="result-section-icon">✅</span>
+          <h3>対象期間の最終日に設置されている機種</h3>
+        </div>
+        <details class="result-details" open>
+          <summary>結果テーブルを表示</summary>
+          <div class="table-wrapper">
+            <table id="comboPresentTable" class="result-table"></table>
+          </div>
+        </details>
+      </div>
 
-  <div class="field">
-    <label>設置台数グループ（機種フィルタとは独立に重ね描き・対象日当日の実測台数で判定・複数選択可・未選択でグループ機能を使用しない）</label>
-    <div class="digit-checkboxes" id="countGroupCheckboxes"></div>
-  </div>
-</section>
-
-<div id="filterBackdrop" class="filter-backdrop"></div>
-
-<nav class="tabs">
-  <button class="tab-btn active" data-tab="ranking">ランキング別勝率</button>
-  <button class="tab-btn" data-tab="threshold">閾値別勝率</button>
-  <button class="tab-btn" data-tab="trend">月次トレンド</button>
-  <button class="tab-btn" data-tab="combo">複合条件スコア探索</button>
-</nav>
-
-<section class="panel tab-panel active" id="tab-ranking">
-  <h2>ランキング別勝率分析</h2>
-    <p>同機種内でルックバック期間の累積差枚が低い順（ワースト順位）に並べ、順位ごとの対象日の勝率・平均差枚・差枚中央値を集計します。機種フィルタと設置台数グループフィルタは互いに独立した系列として、選択した分だけ重ねて表示されます。勝率の右には95%信頼区間（Wilson score interval）を、平均差枚の右には正規近似による95%信頼区間を併記し、件数（n）が20未満の行は参考値として表示を弱めています。勝率・平均差枚・差枚中央値をそれぞれ標準化（z-score化）した上で均等重みで合計した「総合スコア」も算出しており、まだ重みの妥当性は検証中の参考値です。グラフは常に順位順の傾向線として描画され、その上に勝率の信頼区間を帯として重ねます。表の並び順は「信頼度順」で信頼区間下限が高い順、「総合スコア順」で総合スコアが高い順に切り替えられます。</p>
-  <div class="field">
-    <label for="rankingSortMode">結果テーブルの並び順</label>
-    <select id="rankingSortMode">
-      <option value="rank" selected>順位順（ワースト1位から）</option>
-      <option value="confidence">信頼度順（信頼区間下限が高い順）</option>
-      <option value="score">総合スコア順（暫定・均等重み）</option>
-    </select>
-  </div>
-  <button id="runRankingBtn">分析実行</button>
-  <div class="result-area">
-    <details class="result-details">
-      <summary>結果テーブルを表示</summary>
-      <table id="rankingTable" class="result-table"></table>
-    </details>
-    <canvas id="rankingChart" height="120"></canvas>
-  </div>
-</section>
-
-<section class="panel tab-panel" id="tab-threshold">
-  <h2>閾値別勝率分析</h2>
-  <div class="field">
-    <label for="thresholdStep">刻み幅（累積差枚 -30,000～30,000枚の範囲を分割）</label>
-    <select id="thresholdStep">
-      <option value="500">500枚おき</option>
-      <option value="1000" selected>1000枚おき</option>
-      <option value="1500">1500枚おき</option>
-      <option value="2000">2000枚おき</option>
-    </select>
-  </div>
-  <button id="runThresholdBtn">分析実行</button>
-  <div class="result-area">
-    <details class="result-details">
-      <summary>結果テーブルを表示</summary>
-      <table id="thresholdTable" class="result-table"></table>
-    </details>
-    <canvas id="thresholdChart" height="120"></canvas>
-  </div>
-</section>
-
-<section class="panel tab-panel" id="tab-trend">
-  <h2>月次トレンド</h2>
-  <div class="field-row">
-    <div class="field">
-      <label for="trendMode">集計モード</label>
-      <select id="trendMode">
-        <option value="rank">特定の順位（ワースト何位）</option>
-        <option value="threshold">閾値条件</option>
-      </select>
+      <div class="result-section">
+        <div class="result-section-header absent">
+          <span class="result-section-icon">📦</span>
+          <h3>対象期間の最終日に設置されていない機種</h3>
+        </div>
+        <details class="result-details">
+          <summary>結果テーブルを表示</summary>
+          <div class="table-wrapper">
+            <table id="comboAbsentTable" class="result-table"></table>
+          </div>
+        </details>
+      </div>
     </div>
-    <div class="field" id="trendRankField">
-      <label>ワースト順位（複数選択可）</label>
-      <div class="digit-checkboxes" id="trendRankCheckboxes"></div>
-    </div>
-    <div class="field" id="trendThresholdField" style="display:none;">
-      <label for="trendThresholdDirection">比較方向</label>
-      <select id="trendThresholdDirection">
-        <option value="le">以下</option>
-        <option value="ge">以上</option>
-      </select>
-      <input type="text" id="trendThresholdValue" value="-2000" />
-    </div>
-  </div>
-  <button id="runTrendBtn">分析実行</button>
-  <div class="result-area">
-    <details class="result-details">
-      <summary>結果テーブルを表示</summary>
-      <table id="trendTable" class="result-table"></table>
-    </details>
-    <canvas id="trendChart" height="120"></canvas>
-  </div>
-</section>
 
-<section class="panel tab-panel" id="tab-combo">
-  <h2>複合条件スコア探索</h2>
-  <p>機種×累積差枚に関する条件×ルックバック日数の組み合わせを総当たりし、勝率スコアの高い組み合わせを探索します。機種フィルタ・設置台数グループフィルタの選択状態には影響されず、常に全機種が対象です。共通フィルタの対象日の日付末尾・対象期間はここでも適用されます。対象期間の最終日にその機種が設置されているかどうかで、結果を2つのテーブルに分けて表示します。件数（n）が少ない組み合わせは偶然良く見えやすいため、指定した最低件数未満の組み合わせは最初から候補から除外します。組み合わせの数が多いほど偶然良い結果が混ざりやすくなるため、並び順は信頼区間下限を主軸にすることを推奨します。</p>
-
-  <p>「累積差枚順位」は、対象日と同じ日に設置されていた同機種内で、ルックバック期間の累積差枚が何番目に悪い（ワースト）か・良い（TOP）かを順位で見る条件です。設置台数が10台以上ならワースト・TOP1~5位、6~9台なら1~3位、2~5台なら1位のみが「その日において意味のある順位」として有効になり、それを超える順位（例: 6~9台の日のワースト4・5位）は判定不能として集計から除外されます。1台のみ設置の日も同様に除外されます。下のチェックボックスで結果テーブルに表示したい順位を選ぶと、選んだ順位ごとに行が分かれて表示されるため、「ワースト1位と2位と3位でどう違うか」を直接比較できます（同着(タイ)がある場合はRANK方式のため、同じ順位のラインに複数台が並ぶことがあります）。</p>
-
-  <div class="field">
-    <label>探索パターン（切り替えると結果はクリアされます）</label>
-    <div class="radio-list" id="comboPatternRadios">
-      <label><input type="radio" name="comboPattern" value="rank" checked /> 累積差枚順位のみ（💀ワースト・👑TOPを1テーブルに表示）</label>
-      <label><input type="radio" name="comboPattern" value="threshold" /> 累積差枚しきい値のみ</label>
-      <label><input type="radio" name="comboPattern" value="combined" /> 複合（順位×しきい値、💀・👑を1テーブルに表示）</label>
-    </div>
-  </div>
-
-  <div class="field">
-    <label>ルックバック日数（複数選択・1つ以上必須）</label>
-    <div class="digit-checkboxes" id="comboLookbackCheckboxes"></div>
-  </div>
-
-  <div class="field" id="comboRankField">
-    <label>表示する順位（累積差枚順位を使うパターンのみ・ワースト/TOPの区別は上の探索パターンに従う・複数選択可）</label>
-    <div class="digit-checkboxes" id="comboRankCheckboxes"></div>
-  </div>
-
-  <div class="field-row">
-    <div class="field" id="comboThresholdStepField">
-      <label for="comboThresholdStep">累積差枚の刻み幅（しきい値を使うパターンのみ）</label>
-      <select id="comboThresholdStep">
-        <option value="500">500枚おき</option>
-        <option value="1000" selected>1000枚おき</option>
-        <option value="1500">1500枚おき</option>
-        <option value="2000">2000枚おき</option>
-      </select>
-    </div>
-    <div class="field">
-      <label for="comboMinN">最低件数(n)フィルタ</label>
-      <input type="number" id="comboMinN" value="30" min="1" />
-    </div>
-    <div class="field">
-      <label for="comboSortMode">並び順</label>
-      <select id="comboSortMode">
-        <option value="confidence" selected>信頼区間下限順（推奨）</option>
-        <option value="score">総合スコア順（暫定・均等重み）</option>
-      </select>
-    </div>
-  </div>
-
-  <button id="runComboBtn">分析実行</button>
-
-  <div class="result-area">
-    <h3>対象期間の最終日に設置されている機種</h3>
-    <details class="result-details" open>
-      <summary>結果テーブルを表示</summary>
-      <table id="comboPresentTable" class="result-table"></table>
-    </details>
-
-    <h3>対象期間の最終日に設置されていない機種</h3>
-    <details class="result-details">
-      <summary>結果テーブルを表示</summary>
-      <table id="comboAbsentTable" class="result-table"></table>
-    </details>
-  </div>
-</section>
+  </div><!-- /#comboPanel -->
+</main>
 
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.14.2/dist/sql-wasm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="app.js"></script>
 </body>
 </html>
